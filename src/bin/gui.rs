@@ -6,6 +6,9 @@
 //! cargo run --features gui --bin tessera-gui -- data.parquet
 //! ```
 
+// Don't pop up a console window alongside the GUI on Windows release builds.
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
 use std::path::PathBuf;
 
 use clap::Parser;

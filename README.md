@@ -78,6 +78,9 @@ Pass a file on the command line, type a path in the toolbar, or just drag a
 across every column. (Building the GUI needs the usual desktop libraries —
 OpenGL plus X11/Wayland on Linux; nothing extra on Windows or macOS.)
 
+Prebuilt `tessera-gui` binaries ship in the **Windows** and **macOS** release
+archives alongside the TUI; on Linux, build it from source as above.
+
 ## Usage
 
 ```sh

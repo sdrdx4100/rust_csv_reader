@@ -24,10 +24,13 @@ jobs:
         include:
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
+            features: ""
           - os: macos-latest
             target: aarch64-apple-darwin
+            features: "--features gui"
           - os: windows-latest
             target: x86_64-pc-windows-msvc
+            features: "--features gui"
     steps:
       - uses: actions/checkout@v4
 
@@ -37,7 +40,7 @@ jobs:
           targets: ${{ matrix.target }}
 
       - name: Build
-        run: cargo build --release --locked --target ${{ matrix.target }}
+        run: cargo build --release --locked ${{ matrix.features }} --target ${{ matrix.target }}
 
       - name: Resolve tag
         id: tag
@@ -49,8 +52,11 @@ jobs:
         shell: bash
         run: |
           mkdir -p dist
-          bin="target/${{ matrix.target }}/release/tessera"
-          tar -C "$(dirname "$bin")" -czf "dist/tessera-${{ steps.tag.outputs.tag }}-${{ matrix.target }}.tar.gz" tessera
+          dir="target/${{ matrix.target }}/release"
+          # Always ship the TUI; include the GUI binary too when it was built.
+          bins=(tessera)
+          [ -f "$dir/tessera-gui" ] && bins+=(tessera-gui)
+          tar -C "$dir" -czf "dist/tessera-${{ steps.tag.outputs.tag }}-${{ matrix.target }}.tar.gz" "${bins[@]}"
           (cd dist && shasum -a 256 *.tar.gz > "tessera-${{ steps.tag.outputs.tag }}-${{ matrix.target }}.sha256")
 
       - name: Package (windows)
@@ -58,8 +64,10 @@ jobs:
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force -Path dist | Out-Null
-          $bin = "target/${{ matrix.target }}/release/tessera.exe"
-          Compress-Archive -Path $bin -DestinationPath "dist/tessera-${{ steps.tag.outputs.tag }}-${{ matrix.target }}.zip"
+          $dir = "target/${{ matrix.target }}/release"
+          $files = @("$dir/tessera.exe")
+          if (Test-Path "$dir/tessera-gui.exe") { $files += "$dir/tessera-gui.exe" }
+          Compress-Archive -Path $files -DestinationPath "dist/tessera-${{ steps.tag.outputs.tag }}-${{ matrix.target }}.zip"
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
