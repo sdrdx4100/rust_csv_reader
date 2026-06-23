@@ -1,6 +1,7 @@
 //! Tessera — an ultimate terminal viewer for CSV and Parquet files.
 //!
 //! ```text
+//! tessera                 # opens the built-in file browser
 //! tessera data.csv
 //! tessera data.parquet
 //! tessera --delimiter '\t' --no-header data.tsv
@@ -10,7 +11,7 @@ mod app;
 mod data;
 mod ui;
 
-use std::io::{self, Stdout};
+use std::io::{self, Stdout, Write};
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -38,8 +39,8 @@ use crate::data::{FileKind, LoadOptions, Table};
     long_about = None,
 )]
 struct Cli {
-    /// Path to a .csv, .tsv or .parquet file.
-    file: PathBuf,
+    /// Path to a .csv, .tsv or .parquet file. Omit it to open the file browser.
+    file: Option<PathBuf>,
 
     /// Force the file type instead of auto-detecting (csv or parquet).
     #[arg(short = 't', long = "type", value_parser = parse_kind)]
@@ -88,10 +89,19 @@ fn main() -> Result<()> {
         ..Default::default()
     };
 
-    // Load before touching the terminal so errors print cleanly.
-    let table = Table::load(&cli.file, &opts)
-        .with_context(|| format!("failed to load {}", cli.file.display()))?;
-    let app = App::new(table);
+    // With a path, load before touching the terminal so errors print cleanly.
+    // Without one, start in the file browser rooted at the working directory.
+    let app = match &cli.file {
+        Some(path) => {
+            let table = Table::load(path, &opts)
+                .with_context(|| format!("failed to load {}", path.display()))?;
+            App::new(table, opts)
+        }
+        None => {
+            let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+            App::browser_only(opts, cwd)
+        }
+    };
 
     let mut terminal = setup_terminal().context("failed to initialise terminal")?;
     let result = run(&mut terminal, app);
@@ -142,6 +152,48 @@ fn run(terminal: &mut Tui, mut app: App) -> Result<()> {
                 _ => {}
             }
         }
+
+        // Honour any copy request via an OSC 52 escape, which lets the host
+        // terminal place text on the system clipboard — even over SSH.
+        if let Some(text) = app.take_clipboard() {
+            copy_to_clipboard(&text);
+        }
     }
     Ok(())
+}
+
+/// Emit an OSC 52 clipboard-write sequence. Best-effort: terminals that don't
+/// support it simply ignore the escape.
+fn copy_to_clipboard(text: &str) {
+    let mut out = io::stdout();
+    let _ = write!(out, "\x1b]52;c;{}\x07", base64_encode(text.as_bytes()));
+    let _ = out.flush();
+}
+
+/// Standard base64 encoding (no external dependency needed for a few bytes).
+fn base64_encode(data: &[u8]) -> String {
+    const ALPHABET: &[u8; 64] =
+        b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
+    for chunk in data.chunks(3) {
+        let b = [
+            chunk[0],
+            *chunk.get(1).unwrap_or(&0),
+            *chunk.get(2).unwrap_or(&0),
+        ];
+        let n = ((b[0] as u32) << 16) | ((b[1] as u32) << 8) | (b[2] as u32);
+        out.push(ALPHABET[((n >> 18) & 63) as usize] as char);
+        out.push(ALPHABET[((n >> 12) & 63) as usize] as char);
+        out.push(if chunk.len() > 1 {
+            ALPHABET[((n >> 6) & 63) as usize] as char
+        } else {
+            '='
+        });
+        out.push(if chunk.len() > 2 {
+            ALPHABET[(n & 63) as usize] as char
+        } else {
+            '='
+        });
+    }
+    out
 }

@@ -217,6 +217,11 @@ fn load_parquet(path: &Path) -> Result<(SchemaRef, Vec<RecordBatch>)> {
     Ok((schema, batches))
 }
 
+/// Whether a [`friendly_type`] string denotes a right-alignable numeric column.
+pub fn is_numeric_type(ty: &str) -> bool {
+    matches!(ty, "int" | "uint" | "float") || ty.starts_with("decimal")
+}
+
 /// A short, human-readable rendering of an Arrow data type for the schema view.
 fn friendly_type(dt: &DataType) -> String {
     match dt {
