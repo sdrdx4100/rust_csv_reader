@@ -1,0 +1,11 @@
+id,name,department,salary,start_date,active
+1,Alice Johnson,Engineering,95000,2019-03-15,true
+2,Bob Smith,Marketing,72000,2020-07-01,true
+3,Carol Williams,Engineering,110000,2018-01-20,true
+4,David Brown,Sales,68000,2021-11-30,false
+5,Eve Davis,Engineering,98000,2017-09-05,true
+6,Frank Miller,Marketing,75000,2022-02-14,true
+7,Grace Wilson,Sales,71000,2019-06-22,false
+8,Henry Moore,Engineering,105000,2016-04-11,true
+9,Ivy Taylor,Marketing,69000,2023-01-09,true
+10,Jack Anderson,Sales,73000,2020-10-18,true
