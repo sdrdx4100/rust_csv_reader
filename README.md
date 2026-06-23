@@ -57,6 +57,30 @@ cargo build --release   # binary at target/release/tessera
 
 Requires a recent stable Rust toolchain (edition 2021, Rust ≥ 1.80).
 
+## Desktop GUI (optional)
+
+Prefer a window? Tessera ships an optional, deliberately minimal desktop
+viewer — `tessera-gui` — built on [egui](https://github.com/emilk/egui). It
+shows the same CSV/Parquet data in a plain table with a single search box, and
+renders only the rows currently on screen, so opening a **million-row** file
+stays smooth.
+
+```sh
+# build / run the GUI (it is behind the `gui` feature)
+cargo run --release --features gui --bin tessera-gui -- data.parquet
+
+# install it alongside the TUI
+cargo install --path . --features gui
+```
+
+Pass a file on the command line, type a path in the toolbar, or just drag a
+`.csv`/`.parquet` file onto the window. Type in the search box to filter rows
+across every column. (Building the GUI needs the usual desktop libraries —
+OpenGL plus X11/Wayland on Linux; nothing extra on Windows or macOS.)
+
+Prebuilt `tessera-gui` binaries ship in the **Windows** and **macOS** release
+archives alongside the TUI; on Linux, build it from source as above.
+
 ## Usage
 
 ```sh

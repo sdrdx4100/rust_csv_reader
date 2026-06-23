@@ -1,6 +1,6 @@
 [package]
 name = "tessera"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2021"
 rust-version = "1.80"
 authors = ["rust_csv_reader contributors"]
@@ -11,9 +11,18 @@ repository = "https://github.com/sdrdx4100/rust_csv_reader"
 keywords = ["csv", "parquet", "tui", "viewer", "arrow"]
 categories = ["command-line-utilities"]
 
+[lib]
+name = "tessera"
+path = "src/lib.rs"
+
 [[bin]]
 name = "tessera"
 path = "src/main.rs"
+
+[[bin]]
+name = "tessera-gui"
+path = "src/bin/gui.rs"
+required-features = ["gui"]
 
 [dependencies]
 ratatui = "0.30"
@@ -21,9 +30,17 @@ arrow = { version = "59", features = ["csv"] }
 parquet = { version = "59", features = ["arrow"] }
 clap = { version = "4", features = ["derive"] }
 anyhow = "1"
+eframe = { version = "0.30.0", default-features = false, features = ["glow", "default_fonts", "x11", "wayland"], optional = true }
+egui_extras = { version = "0.30.0", optional = true }
 
 [profile.release]
 opt-level = 3
 lto = "thin"
 codegen-units = 1
 strip = true
+
+[features]
+default = []
+# Build the optional desktop GUI (`tessera-gui`) with: cargo build --features gui
+gui = ["dep:eframe", "dep:egui_extras"]
+

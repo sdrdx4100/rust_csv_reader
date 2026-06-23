@@ -7,10 +7,6 @@
 //! tessera --delimiter '\t' --no-header data.tsv
 //! ```
 
-mod app;
-mod data;
-mod ui;
-
 use std::io::{self, Stdout, Write};
 use std::path::PathBuf;
 use std::time::Duration;
@@ -27,8 +23,9 @@ use ratatui::crossterm::terminal::{
 use ratatui::prelude::CrosstermBackend;
 use ratatui::Terminal;
 
-use crate::app::App;
-use crate::data::{FileKind, LoadOptions, Table};
+use tessera::app::App;
+use tessera::data::{FileKind, LoadOptions, Table};
+use tessera::ui;
 
 /// Command-line interface.
 #[derive(Parser, Debug)]
