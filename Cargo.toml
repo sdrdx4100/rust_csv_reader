@@ -1,0 +1,29 @@
+[package]
+name = "tessera"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.80"
+authors = ["rust_csv_reader contributors"]
+description = "Tessera — an ultimate terminal viewer for CSV and Parquet files"
+readme = "README.md"
+license = "MIT"
+repository = "https://github.com/sdrdx4100/rust_csv_reader"
+keywords = ["csv", "parquet", "tui", "viewer", "arrow"]
+categories = ["command-line-utilities"]
+
+[[bin]]
+name = "tessera"
+path = "src/main.rs"
+
+[dependencies]
+ratatui = "0.30"
+arrow = { version = "59", features = ["csv"] }
+parquet = { version = "59", features = ["arrow"] }
+clap = { version = "4", features = ["derive"] }
+anyhow = "1"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = true
