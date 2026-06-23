@@ -23,16 +23,24 @@ type-aware formatter.
 
 - **CSV & Parquet** in one tool, auto-detected by extension or content (the
   Parquet `PAR1` magic header). Force it with `--type`.
+- **Built-in file browser** — run `tessera` with no arguments to pick a file,
+  or press `o` any time to open another one without leaving the app.
 - **Typed columns** with schema inference for CSV; numeric columns are
   right-aligned automatically.
+- **Sort** by any column (`s`) — ascending → descending → off — type-aware so
+  numbers sort numerically and nulls sink to the bottom.
+- **Column statistics** in the schema view (`i`): non-null/null counts plus
+  min, max and mean for numeric columns.
+- **Copy & export**: `y`/`Y` copy the current cell/row to the system clipboard
+  (via OSC 52, works over SSH); `e` writes the current filtered+sorted view to
+  a `.view.csv` next to the source.
 - **Frozen header row** and a **row-number gutter** that stay put while you
-  scroll in both directions.
+  scroll in both directions, with subtle zebra striping for readability.
 - **Vim-style and arrow navigation**, paging, half-paging, jump-to-edges, and
   mouse-wheel scrolling.
 - **Incremental filter** (`/`) across all columns, with a live match count.
 - **Go to row** (`:`) by number.
 - **Cell inspector** (`Enter`) for values too wide for the grid.
-- **Schema overview** (`i`) listing every column and its type.
 - **Adjustable column widths** (`<` / `>`).
 - Robust terminal handling: alternate screen, mouse capture, and a panic hook
   that always restores your terminal.
@@ -52,6 +60,7 @@ Requires a recent stable Rust toolchain (edition 2021, Rust ≥ 1.80).
 ## Usage
 
 ```sh
+tessera                      # no file? opens the built-in file browser
 tessera data.csv
 tessera data.parquet
 tessera --type csv mystery_file
@@ -61,6 +70,9 @@ tessera --delimiter '\t' --no-header data.tsv
 # try the bundled sample
 tessera samples/people.csv
 ```
+
+On Windows you can also drag a `.csv`/`.parquet` file onto `tessera.exe`, or run
+it with no arguments and browse to the file from inside the app.
 
 ### Options
 
@@ -81,13 +93,21 @@ tessera samples/people.csv
 | `Ctrl-u` / `Ctrl-d` | Half page up / down |
 | mouse wheel | Scroll rows |
 | `Enter` / `Space` | Inspect the full cell value |
-| `i` | Schema / column overview |
+| `i` | Schema + column statistics |
+| `s` | Sort by current column (asc → desc → off) |
 | `<` / `>` | Shrink / grow the current column |
 | `/` | Incremental filter across all columns |
 | `n` | Clear the active filter |
 | `:` | Go to a row number |
+| `o` | Open another file (file browser) |
+| `y` / `Y` | Copy current cell / row to the clipboard |
+| `e` | Export the current view to `<name>.view.csv` |
 | `?` | Toggle help |
 | `q` / `Esc` / `Ctrl-c` | Quit |
+
+In the **file browser**: `↑`/`↓` (or `j`/`k`) move, `Enter` opens a file or
+enters a folder, `Backspace` goes up a directory, and `q`/`Esc` returns to the
+table (or quits if none is open).
 
 ## How it works
 
