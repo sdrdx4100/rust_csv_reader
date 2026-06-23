@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 use eframe::egui;
 use egui_extras::{Column, TableBuilder};
 
-use crate::data::{LoadOptions, Table};
+use crate::data::{is_numeric_type, LoadOptions, Table};
 
 /// Launch the desktop viewer, optionally opening `path` on start-up.
 pub fn run(path: Option<PathBuf>) -> eframe::Result<()> {
@@ -119,6 +119,26 @@ impl TesseraGui {
     }
 }
 
+/// Render one data cell: numeric values are right-aligned, the full value
+/// shows on hover (so clipped cells stay readable), and a click copies it.
+fn cell_ui(ui: &mut egui::Ui, text: &str, numeric: bool) {
+    let add = |ui: &mut egui::Ui| {
+        let resp = ui.add(
+            egui::Label::new(text)
+                .truncate()
+                .sense(egui::Sense::click()),
+        );
+        if !text.is_empty() && resp.on_hover_text(text).clicked() {
+            ui.ctx().copy_text(text.to_owned());
+        }
+    };
+    if numeric {
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), add);
+    } else {
+        add(ui);
+    }
+}
+
 impl eframe::App for TesseraGui {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         // Accept a file dropped anywhere on the window.
@@ -205,6 +225,7 @@ impl eframe::App for TesseraGui {
             }
 
             let names = table.column_names();
+            let types = table.column_types();
             let filtered = &self.filtered;
             // Build the column formatters once per frame; cell access is then cheap.
             let fmts = table.formatters().ok();
@@ -242,7 +263,7 @@ impl eframe::App for TesseraGui {
                                     Some(f) => f[c].value(table_row).to_string(),
                                     None => table.cell(table_row, c),
                                 };
-                                ui.label(text);
+                                cell_ui(ui, &text, is_numeric_type(&types[c]));
                             });
                         }
                     });
