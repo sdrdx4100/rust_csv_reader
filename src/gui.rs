@@ -231,42 +231,54 @@ impl eframe::App for TesseraGui {
             let fmts = table.formatters().ok();
 
             let row_height = 18.0;
-            let mut builder = TableBuilder::new(ui)
-                .striped(true)
-                .resizable(true)
-                .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
-                .column(Column::auto().at_least(40.0)); // row-number gutter
-            for _ in 0..ncols {
-                builder = builder.column(Column::initial(140.0).at_least(40.0).clip(true).resizable(true));
-            }
-
-            builder
-                .header(22.0, |mut header| {
-                    header.col(|ui| {
-                        ui.strong("#");
-                    });
-                    for name in names {
-                        header.col(|ui| {
-                            ui.strong(name);
-                        });
+            // egui_extras tables only scroll vertically on their own, so wrap
+            // the whole thing in a horizontal scroll area to pan wide tables
+            // left/right. The table keeps its own vertical *virtual* scrolling,
+            // so millions of rows stay cheap.
+            egui::ScrollArea::horizontal()
+                .auto_shrink([false, false])
+                .show(ui, |ui| {
+                    let mut builder = TableBuilder::new(ui)
+                        .striped(true)
+                        .resizable(true)
+                        .vscroll(true)
+                        .auto_shrink([false, false])
+                        .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
+                        .column(Column::auto().at_least(40.0)); // row-number gutter
+                    for _ in 0..ncols {
+                        builder = builder.column(
+                            Column::initial(140.0).at_least(40.0).clip(true).resizable(true),
+                        );
                     }
-                })
-                .body(|body| {
-                    body.rows(row_height, filtered.len(), |mut row| {
-                        let table_row = filtered[row.index()];
-                        row.col(|ui| {
-                            ui.weak((table_row + 1).to_string());
-                        });
-                        for c in 0..ncols {
-                            row.col(|ui| {
-                                let text = match &fmts {
-                                    Some(f) => f[c].value(table_row).to_string(),
-                                    None => table.cell(table_row, c),
-                                };
-                                cell_ui(ui, &text, is_numeric_type(&types[c]));
+
+                    builder
+                        .header(22.0, |mut header| {
+                            header.col(|ui| {
+                                ui.strong("#");
                             });
-                        }
-                    });
+                            for name in names {
+                                header.col(|ui| {
+                                    ui.strong(name);
+                                });
+                            }
+                        })
+                        .body(|body| {
+                            body.rows(row_height, filtered.len(), |mut row| {
+                                let table_row = filtered[row.index()];
+                                row.col(|ui| {
+                                    ui.weak((table_row + 1).to_string());
+                                });
+                                for c in 0..ncols {
+                                    row.col(|ui| {
+                                        let text = match &fmts {
+                                            Some(f) => f[c].value(table_row).to_string(),
+                                            None => table.cell(table_row, c),
+                                        };
+                                        cell_ui(ui, &text, is_numeric_type(&types[c]));
+                                    });
+                                }
+                            });
+                        });
                 });
         });
     }
