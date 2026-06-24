@@ -12,3 +12,6 @@ pub mod ui;
 
 #[cfg(feature = "gui")]
 pub mod gui;
+
+#[cfg(feature = "gui")]
+pub mod sql;
