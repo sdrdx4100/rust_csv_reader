@@ -371,6 +371,13 @@ fn render_data_table(
     // egui_extras tables only scroll vertically on their own, so wrap the whole
     // thing in a horizontal scroll area to pan wide tables left/right. The table
     // keeps its own vertical *virtual* scrolling, so millions of rows stay cheap.
+    //
+    // Inside the horizontal scroll area the available height is unbounded, so we
+    // capture the panel height up front and pin the table's vertical scroll
+    // viewport to it — otherwise the vertical scrollbar never appears. Leave room
+    // for the (frozen) header row so the last data rows aren't clipped off.
+    let header_height = 22.0;
+    let viewport_height = (ui.available_height() - header_height).max(50.0);
     egui::ScrollArea::horizontal()
         .auto_shrink([false, false])
         .show(ui, |ui| {
@@ -378,6 +385,8 @@ fn render_data_table(
                 .striped(true)
                 .resizable(true)
                 .vscroll(true)
+                .max_scroll_height(viewport_height)
+                .min_scrolled_height(0.0)
                 .auto_shrink([false, false])
                 .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
                 .column(Column::auto().at_least(40.0)); // row-number gutter
