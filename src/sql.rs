@@ -96,3 +96,65 @@ impl SqlEngine {
         })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+
+    fn sample_csv() -> std::path::PathBuf {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static SEQ: AtomicU32 = AtomicU32::new(0);
+        let mut p = std::env::temp_dir();
+        p.push(format!(
+            "tessera_sql_{}_{}.csv",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        let mut f = std::fs::File::create(&p).unwrap();
+        writeln!(f, "id,name,score").unwrap();
+        for i in 0..20 {
+            writeln!(f, "{i},name{i},{}", i * 10).unwrap();
+        }
+        f.flush().unwrap();
+        p
+    }
+
+    #[test]
+    fn runs_select_with_filter_and_order() {
+        let path = sample_csv();
+        let engine = SqlEngine::new(&path, FileKind::Csv).unwrap();
+
+        let res = engine
+            .query(
+                "SELECT id, score FROM data WHERE score >= 150 ORDER BY score DESC",
+                1000,
+            )
+            .unwrap();
+        assert_eq!(res.columns, vec!["id".to_string(), "score".to_string()]);
+        // scores 150..190 → ids 15..19, five rows, highest first.
+        assert_eq!(res.rows.len(), 5);
+        assert_eq!(res.rows[0], vec!["19".to_string(), "190".to_string()]);
+        assert!(!res.truncated);
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn reports_truncation_past_the_cap() {
+        let path = sample_csv();
+        let engine = SqlEngine::new(&path, FileKind::Csv).unwrap();
+        let res = engine.query("SELECT * FROM data", 5).unwrap();
+        assert_eq!(res.rows.len(), 5);
+        assert!(res.truncated);
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn surfaces_query_errors() {
+        let path = sample_csv();
+        let engine = SqlEngine::new(&path, FileKind::Csv).unwrap();
+        assert!(engine.query("SELECT * FROM nonexistent", 10).is_err());
+        std::fs::remove_file(&path).ok();
+    }
+}
