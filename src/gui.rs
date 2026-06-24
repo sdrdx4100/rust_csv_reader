@@ -11,6 +11,10 @@ use eframe::egui;
 use egui_extras::{Column, TableBuilder};
 
 use crate::data::{is_numeric_type, LoadOptions, Table};
+use crate::sql::{SqlEngine, SqlResult};
+
+/// Most rows a SQL result will display (keeps memory and build time bounded).
+const SQL_ROW_CAP: usize = 100_000;
 
 /// Launch the desktop viewer, optionally opening `path` on start-up.
 pub fn run(path: Option<PathBuf>) -> eframe::Result<()> {
@@ -36,6 +40,14 @@ struct TesseraGui {
     filtered: Vec<usize>,
     /// Lazily-built, lowercased per-row text used for fast substring filtering.
     haystack: Option<Vec<String>>,
+
+    /// When true the toolbar shows a SQL box instead of the substring search.
+    sql_mode: bool,
+    sql_input: String,
+    /// DataFusion session (built lazily on first query), result, and any error.
+    sql_engine: Option<SqlEngine>,
+    sql_result: Option<SqlResult>,
+    sql_error: Option<String>,
 }
 
 impl TesseraGui {
@@ -48,6 +60,11 @@ impl TesseraGui {
             last_query: String::new(),
             filtered: Vec::new(),
             haystack: None,
+            sql_mode: false,
+            sql_input: String::new(),
+            sql_engine: None,
+            sql_result: None,
+            sql_error: None,
         };
         if let Some(p) = path {
             app.open(&p);
@@ -65,9 +82,48 @@ impl TesseraGui {
                 self.query.clear();
                 self.last_query.clear();
                 self.path_input = path.display().to_string();
+                // A new file means a fresh SQL session and cleared results.
+                self.sql_engine = None;
+                self.sql_result = None;
+                self.sql_error = None;
             }
             Err(e) => {
                 self.error = Some(format!("{e:#}"));
+            }
+        }
+    }
+
+    /// Execute the SQL box against the open file, building the engine on demand.
+    fn run_sql(&mut self) {
+        let Some((path, kind)) = self.table.as_ref().map(|t| (t.path.clone(), t.kind)) else {
+            self.sql_error = Some("open a file first".into());
+            self.sql_result = None;
+            return;
+        };
+        if self.sql_input.trim().is_empty() {
+            self.sql_result = None;
+            self.sql_error = None;
+            return;
+        }
+        if self.sql_engine.is_none() {
+            match SqlEngine::new(&path, kind) {
+                Ok(engine) => self.sql_engine = Some(engine),
+                Err(e) => {
+                    self.sql_error = Some(format!("{e:#}"));
+                    self.sql_result = None;
+                    return;
+                }
+            }
+        }
+        let engine = self.sql_engine.as_ref().expect("engine built");
+        match engine.query(self.sql_input.trim(), SQL_ROW_CAP) {
+            Ok(res) => {
+                self.sql_result = Some(res);
+                self.sql_error = None;
+            }
+            Err(e) => {
+                self.sql_error = Some(format!("{e:#}"));
+                self.sql_result = None;
             }
         }
     }
@@ -171,14 +227,28 @@ impl eframe::App for TesseraGui {
                 }
 
                 ui.separator();
-                ui.label("Search:");
-                ui.add(
-                    egui::TextEdit::singleline(&mut self.query)
-                        .desired_width(220.0)
-                        .hint_text("filter all columns"),
-                );
-                if ui.button("✖").on_hover_text("clear search").clicked() {
-                    self.query.clear();
+                ui.selectable_value(&mut self.sql_mode, false, "Search");
+                ui.selectable_value(&mut self.sql_mode, true, "SQL");
+                if self.sql_mode {
+                    let resp = ui.add(
+                        egui::TextEdit::singleline(&mut self.sql_input)
+                            .desired_width(420.0)
+                            .hint_text("SELECT * FROM data WHERE …"),
+                    );
+                    let run = ui.button("Run ▶").clicked()
+                        || (resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)));
+                    if run {
+                        self.run_sql();
+                    }
+                } else {
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.query)
+                            .desired_width(220.0)
+                            .hint_text("filter all columns"),
+                    );
+                    if ui.button("✖").on_hover_text("clear search").clicked() {
+                        self.query.clear();
+                    }
                 }
             });
 
@@ -208,6 +278,18 @@ impl eframe::App for TesseraGui {
                 if let Some(err) = &self.error {
                     ui.colored_label(egui::Color32::from_rgb(220, 80, 80), err);
                 }
+                if self.sql_mode {
+                    if let Some(res) = &self.sql_result {
+                        ui.weak(if res.truncated {
+                            format!("  ·  SQL: showing first {} rows", SQL_ROW_CAP)
+                        } else {
+                            format!("  ·  SQL: {} rows", res.rows.len())
+                        });
+                    }
+                    if let Some(err) = &self.sql_error {
+                        ui.colored_label(egui::Color32::from_rgb(220, 80, 80), err);
+                    }
+                }
             });
             ui.add_space(2.0);
         });
@@ -215,6 +297,34 @@ impl eframe::App for TesseraGui {
         self.refresh_filter();
 
         egui::CentralPanel::default().show(ctx, |ui| {
+            // In SQL mode the query result replaces the normal table view.
+            if self.sql_mode {
+                match &self.sql_result {
+                    Some(res) if !res.columns.is_empty() => {
+                        render_data_table(
+                            ui,
+                            &res.columns,
+                            res.rows.len(),
+                            |_| false,
+                            |r| (r + 1).to_string(),
+                            |r, c| res.rows[r].get(c).cloned().unwrap_or_default(),
+                        );
+                    }
+                    Some(_) => {
+                        ui.weak("(query returned no columns)");
+                    }
+                    None if self.sql_error.is_none() => {
+                        ui.weak(format!(
+                            "Write SQL above and press Run — the file is table `{0}`.  \
+                             e.g.  SELECT * FROM {0} LIMIT 100",
+                            SqlEngine::TABLE,
+                        ));
+                    }
+                    None => {}
+                }
+                return;
+            }
+
             let Some(table) = &self.table else {
                 return;
             };
@@ -230,58 +340,77 @@ impl eframe::App for TesseraGui {
             // Build the column formatters once per frame; cell access is then cheap.
             let fmts = table.formatters().ok();
 
-            let row_height = 18.0;
-            // egui_extras tables only scroll vertically on their own, so wrap
-            // the whole thing in a horizontal scroll area to pan wide tables
-            // left/right. The table keeps its own vertical *virtual* scrolling,
-            // so millions of rows stay cheap.
-            egui::ScrollArea::horizontal()
-                .auto_shrink([false, false])
-                .show(ui, |ui| {
-                    let mut builder = TableBuilder::new(ui)
-                        .striped(true)
-                        .resizable(true)
-                        .vscroll(true)
-                        .auto_shrink([false, false])
-                        .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
-                        .column(Column::auto().at_least(40.0)); // row-number gutter
-                    for _ in 0..ncols {
-                        builder = builder.column(
-                            Column::initial(140.0).at_least(40.0).clip(true).resizable(true),
-                        );
-                    }
-
-                    builder
-                        .header(22.0, |mut header| {
-                            header.col(|ui| {
-                                ui.strong("#");
-                            });
-                            for name in names {
-                                header.col(|ui| {
-                                    ui.strong(name);
-                                });
-                            }
-                        })
-                        .body(|body| {
-                            body.rows(row_height, filtered.len(), |mut row| {
-                                let table_row = filtered[row.index()];
-                                row.col(|ui| {
-                                    ui.weak((table_row + 1).to_string());
-                                });
-                                for c in 0..ncols {
-                                    row.col(|ui| {
-                                        let text = match &fmts {
-                                            Some(f) => f[c].value(table_row).to_string(),
-                                            None => table.cell(table_row, c),
-                                        };
-                                        cell_ui(ui, &text, is_numeric_type(&types[c]));
-                                    });
-                                }
-                            });
-                        });
-                });
+            render_data_table(
+                ui,
+                names,
+                filtered.len(),
+                |c| is_numeric_type(&types[c]),
+                |r| (filtered[r] + 1).to_string(),
+                |r, c| match &fmts {
+                    Some(f) => f[c].value(filtered[r]).to_string(),
+                    None => table.cell(filtered[r], c),
+                },
+            );
         });
     }
+}
+
+/// Render a virtualised, horizontally-scrollable grid. Shared by the normal
+/// table view and the SQL result view; callers supply the column names and
+/// closures to fetch each gutter label / cell value and to flag numeric columns.
+fn render_data_table(
+    ui: &mut egui::Ui,
+    names: &[String],
+    nrows: usize,
+    is_num: impl Fn(usize) -> bool,
+    gutter: impl Fn(usize) -> String,
+    cell: impl Fn(usize, usize) -> String,
+) {
+    let ncols = names.len();
+    let row_height = 18.0;
+    // egui_extras tables only scroll vertically on their own, so wrap the whole
+    // thing in a horizontal scroll area to pan wide tables left/right. The table
+    // keeps its own vertical *virtual* scrolling, so millions of rows stay cheap.
+    egui::ScrollArea::horizontal()
+        .auto_shrink([false, false])
+        .show(ui, |ui| {
+            let mut builder = TableBuilder::new(ui)
+                .striped(true)
+                .resizable(true)
+                .vscroll(true)
+                .auto_shrink([false, false])
+                .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
+                .column(Column::auto().at_least(40.0)); // row-number gutter
+            for _ in 0..ncols {
+                builder = builder
+                    .column(Column::initial(140.0).at_least(40.0).clip(true).resizable(true));
+            }
+
+            builder
+                .header(22.0, |mut header| {
+                    header.col(|ui| {
+                        ui.strong("#");
+                    });
+                    for name in names {
+                        header.col(|ui| {
+                            ui.strong(name);
+                        });
+                    }
+                })
+                .body(|body| {
+                    body.rows(row_height, nrows, |mut row| {
+                        let r = row.index();
+                        row.col(|ui| {
+                            ui.weak(gutter(r));
+                        });
+                        for c in 0..ncols {
+                            row.col(|ui| {
+                                cell_ui(ui, &cell(r, c), is_num(c));
+                            });
+                        }
+                    });
+                });
+        });
 }
 
 #[cfg(test)]

@@ -76,9 +76,20 @@ cargo install --path . --features gui
 Pass a file on the command line, type a path in the toolbar, or just drag a
 `.csv`/`.parquet` file onto the window. Type in the search box to filter rows
 across every column. Numeric columns are right-aligned; hover a cell to read
-its full value (handy when it's clipped) and click it to copy. (Building the
-GUI needs the usual desktop libraries — OpenGL plus X11/Wayland on Linux;
-nothing extra on Windows or macOS.)
+its full value (handy when it's clipped) and click it to copy. Wide tables
+scroll horizontally, and the row grid is virtualised so million-row files stay
+smooth. (Building the GUI needs the usual desktop libraries — OpenGL plus
+X11/Wayland on Linux; nothing extra on Windows or macOS.)
+
+Flip the toolbar toggle from **Search** to **SQL** to query the file with
+[DataFusion](https://datafusion.apache.org/): the open file is registered as a
+table named `data`, so you can write things like
+
+```sql
+SELECT name, score FROM data WHERE score > 100 ORDER BY score DESC LIMIT 50
+```
+
+Results render in the same grid (capped at 100k rows for display).
 
 Prebuilt `tessera-gui` binaries ship in the **Windows** and **macOS** release
 archives alongside the TUI; on Linux, build it from source as above.
