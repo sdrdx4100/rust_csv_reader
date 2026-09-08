@@ -35,8 +35,10 @@ impl SqlEngine {
     /// The SQL table name the source file is registered under.
     pub const TABLE: &'static str = "data";
 
-    /// Register `path` (interpreted as `kind`) as the `data` table.
-    pub fn new(path: &Path, kind: FileKind) -> Result<SqlEngine> {
+    /// Register `path` (interpreted as `kind`) as the `data` table. For CSV the
+    /// `delimiter` and `has_header` settings must match how the file is being
+    /// viewed, so SQL sees the same columns.
+    pub fn new(path: &Path, kind: FileKind, delimiter: u8, has_header: bool) -> Result<SqlEngine> {
         let rt = tokio::runtime::Runtime::new()?;
         let ctx = SessionContext::new();
         let p = path
@@ -45,7 +47,10 @@ impl SqlEngine {
         rt.block_on(async {
             match kind {
                 FileKind::Csv => {
-                    ctx.register_csv(Self::TABLE, p, CsvReadOptions::new()).await
+                    let opts = CsvReadOptions::new()
+                        .delimiter(delimiter)
+                        .has_header(has_header);
+                    ctx.register_csv(Self::TABLE, p, opts).await
                 }
                 FileKind::Parquet => {
                     ctx.register_parquet(Self::TABLE, p, ParquetReadOptions::default())
@@ -123,7 +128,7 @@ mod tests {
     #[test]
     fn runs_select_with_filter_and_order() {
         let path = sample_csv();
-        let engine = SqlEngine::new(&path, FileKind::Csv).unwrap();
+        let engine = SqlEngine::new(&path, FileKind::Csv, b',', true).unwrap();
 
         let res = engine
             .query(
@@ -143,7 +148,7 @@ mod tests {
     #[test]
     fn reports_truncation_past_the_cap() {
         let path = sample_csv();
-        let engine = SqlEngine::new(&path, FileKind::Csv).unwrap();
+        let engine = SqlEngine::new(&path, FileKind::Csv, b',', true).unwrap();
         let res = engine.query("SELECT * FROM data", 5).unwrap();
         assert_eq!(res.rows.len(), 5);
         assert!(res.truncated);
@@ -153,7 +158,7 @@ mod tests {
     #[test]
     fn surfaces_query_errors() {
         let path = sample_csv();
-        let engine = SqlEngine::new(&path, FileKind::Csv).unwrap();
+        let engine = SqlEngine::new(&path, FileKind::Csv, b',', true).unwrap();
         assert!(engine.query("SELECT * FROM nonexistent", 10).is_err());
         std::fs::remove_file(&path).ok();
     }

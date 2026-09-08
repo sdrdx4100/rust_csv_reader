@@ -16,10 +16,51 @@ use crate::sql::{SqlEngine, SqlResult};
 /// Most rows a SQL result will display (keeps memory and build time bounded).
 const SQL_ROW_CAP: usize = 100_000;
 
+/// CSV field delimiter choices offered in the toolbar.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Delimiter {
+    Comma,
+    Tab,
+    Semicolon,
+    Pipe,
+}
+
+impl Delimiter {
+    const ALL: [Delimiter; 4] = [
+        Delimiter::Comma,
+        Delimiter::Tab,
+        Delimiter::Semicolon,
+        Delimiter::Pipe,
+    ];
+
+    fn byte(self) -> u8 {
+        match self {
+            Delimiter::Comma => b',',
+            Delimiter::Tab => b'\t',
+            Delimiter::Semicolon => b';',
+            Delimiter::Pipe => b'|',
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Delimiter::Comma => "Comma",
+            Delimiter::Tab => "Tab",
+            Delimiter::Semicolon => "Semicolon",
+            Delimiter::Pipe => "Pipe",
+        }
+    }
+}
+
 /// Launch the desktop viewer, optionally opening `path` on start-up.
 pub fn run(path: Option<PathBuf>) -> eframe::Result<()> {
+    let mut viewport = egui::ViewportBuilder::default().with_inner_size([1000.0, 700.0]);
+    // Taskbar / Alt-Tab icon (best-effort; ignored if decoding fails).
+    if let Ok(icon) = eframe::icon_data::from_png_bytes(include_bytes!("../assets/icon.png")) {
+        viewport = viewport.with_icon(std::sync::Arc::new(icon));
+    }
     let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default().with_inner_size([1000.0, 700.0]),
+        viewport,
         ..Default::default()
     };
     eframe::run_native(
@@ -33,6 +74,10 @@ struct TesseraGui {
     table: Option<Table>,
     error: Option<String>,
     path_input: String,
+
+    /// CSV parse settings (ignored for Parquet), adjustable from the toolbar.
+    delimiter: Delimiter,
+    has_header: bool,
 
     /// Live search query and the row indices that currently match it.
     query: String,
@@ -56,6 +101,8 @@ impl TesseraGui {
             table: None,
             error: None,
             path_input: String::new(),
+            delimiter: Delimiter::Comma,
+            has_header: true,
             query: String::new(),
             last_query: String::new(),
             filtered: Vec::new(),
@@ -73,7 +120,12 @@ impl TesseraGui {
     }
 
     fn open(&mut self, path: &Path) {
-        match Table::load(path, &LoadOptions::default()) {
+        let opts = LoadOptions {
+            delimiter: self.delimiter.byte(),
+            has_header: self.has_header,
+            ..Default::default()
+        };
+        match Table::load(path, &opts) {
             Ok(table) => {
                 self.filtered = (0..table.num_rows()).collect();
                 self.table = Some(table);
@@ -93,6 +145,13 @@ impl TesseraGui {
         }
     }
 
+    /// Re-open the current file — used when the CSV parse settings change.
+    fn reopen(&mut self) {
+        if let Some(path) = self.table.as_ref().map(|t| t.path.clone()) {
+            self.open(&path);
+        }
+    }
+
     /// Execute the SQL box against the open file, building the engine on demand.
     fn run_sql(&mut self) {
         let Some((path, kind)) = self.table.as_ref().map(|t| (t.path.clone(), t.kind)) else {
@@ -106,7 +165,7 @@ impl TesseraGui {
             return;
         }
         if self.sql_engine.is_none() {
-            match SqlEngine::new(&path, kind) {
+            match SqlEngine::new(&path, kind, self.delimiter.byte(), self.has_header) {
                 Ok(engine) => self.sql_engine = Some(engine),
                 Err(e) => {
                     self.sql_error = Some(format!("{e:#}"));
@@ -224,6 +283,22 @@ impl eframe::App for TesseraGui {
                     if !p.as_os_str().is_empty() {
                         self.open(&p);
                     }
+                }
+
+                // CSV parse settings. Changing either re-opens the current file
+                // (and resets the SQL session) so both views agree.
+                let before = (self.delimiter, self.has_header);
+                egui::ComboBox::from_id_salt("delimiter")
+                    .selected_text(self.delimiter.label())
+                    .show_ui(ui, |ui| {
+                        for d in Delimiter::ALL {
+                            ui.selectable_value(&mut self.delimiter, d, d.label());
+                        }
+                    });
+                ui.checkbox(&mut self.has_header, "Header")
+                    .on_hover_text("first row is column names");
+                if (self.delimiter, self.has_header) != before {
+                    self.reopen();
                 }
 
                 ui.separator();

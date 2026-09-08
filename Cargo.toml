@@ -1,6 +1,6 @@
 [package]
 name = "tessera"
-version = "0.1.6"
+version = "0.1.7"
 edition = "2021"
 rust-version = "1.86"
 authors = ["rust_csv_reader contributors"]
@@ -45,4 +45,7 @@ strip = true
 default = []
 # Build the optional desktop GUI (`tessera-gui`) with: cargo build --features gui
 gui = ["dep:eframe", "dep:egui_extras", "dep:datafusion", "dep:tokio"]
+
+[build-dependencies]
+winresource = "0.1.31"
 
