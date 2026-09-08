@@ -2,8 +2,9 @@
 
 **An ultimate terminal viewer for CSV and Parquet files**, written in Rust.
 
-Tessera opens tabular data of any size in a fast, keyboard-driven TUI. CSV and
-Parquet inputs are normalised through [Apache Arrow](https://arrow.apache.org/),
+Tessera opens large CSV and Parquet files in a fast, keyboard-driven TUI. The
+whole file is loaded into memory (so it's bounded by your RAM, not streamed).
+Inputs are normalised through [Apache Arrow](https://arrow.apache.org/),
 so columns are correctly typed and every value — integers, floats, dates,
 timestamps, decimals, nested lists/structs — is rendered with Arrow's
 type-aware formatter.
@@ -55,7 +56,7 @@ cargo install --path .
 cargo build --release   # binary at target/release/tessera
 ```
 
-Requires a recent stable Rust toolchain (edition 2021, Rust ≥ 1.80).
+Requires a recent stable Rust toolchain (edition 2021, Rust ≥ 1.86).
 
 ## Desktop GUI (optional)
 
@@ -74,12 +75,15 @@ cargo install --path . --features gui
 ```
 
 Pass a file on the command line, type a path in the toolbar, or just drag a
-`.csv`/`.parquet` file onto the window. Type in the search box to filter rows
-across every column. Numeric columns are right-aligned; hover a cell to read
-its full value (handy when it's clipped) and click it to copy. Wide tables
-scroll horizontally, and the row grid is virtualised so million-row files stay
-smooth. (Building the GUI needs the usual desktop libraries — OpenGL plus
-X11/Wayland on Linux; nothing extra on Windows or macOS.)
+`.csv`/`.parquet` file onto the window. For CSV/TSV, pick the field delimiter
+(comma, tab, semicolon or pipe) and toggle whether the first row is a header
+from the toolbar — the view (and SQL) reload with those settings. Type in the
+search box to filter rows across every column. Numeric columns are
+right-aligned; hover a cell to read its full value (handy when it's clipped)
+and click it to copy. Wide tables scroll horizontally, and the row grid is
+virtualised so million-row files stay smooth. (Building the GUI needs the usual
+desktop libraries — OpenGL plus X11/Wayland on Linux; nothing extra on Windows
+or macOS.)
 
 Flip the toolbar toggle from **Search** to **SQL** to query the file with
 [DataFusion](https://datafusion.apache.org/): the open file is registered as a
