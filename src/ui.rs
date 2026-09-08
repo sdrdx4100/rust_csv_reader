@@ -517,7 +517,7 @@ fn fit(s: &str, width: usize) -> String {
     if count <= width {
         let mut out = String::with_capacity(width);
         out.push_str(s);
-        out.extend(std::iter::repeat(' ').take(width - count));
+        out.extend(std::iter::repeat_n(' ', width - count));
         out
     } else if width == 0 {
         String::new()
@@ -535,7 +535,7 @@ fn fit_right(s: &str, width: usize) -> String {
     let count = s.chars().count();
     if count <= width {
         let mut out = String::with_capacity(width);
-        out.extend(std::iter::repeat(' ').take(width - count));
+        out.extend(std::iter::repeat_n(' ', width - count));
         out.push_str(s);
         out
     } else {

@@ -2,7 +2,7 @@
 name = "tessera"
 version = "0.1.6"
 edition = "2021"
-rust-version = "1.80"
+rust-version = "1.86"
 authors = ["rust_csv_reader contributors"]
 description = "Tessera — an ultimate terminal viewer for CSV and Parquet files"
 readme = "README.md"

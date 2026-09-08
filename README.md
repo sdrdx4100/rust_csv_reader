@@ -55,7 +55,7 @@ cargo install --path .
 cargo build --release   # binary at target/release/tessera
 ```
 
-Requires a recent stable Rust toolchain (edition 2021, Rust ≥ 1.80).
+Requires a recent stable Rust toolchain (edition 2021, Rust ≥ 1.86).
 
 ## Desktop GUI (optional)
 

@@ -476,26 +476,33 @@ impl App {
             .visible
             .iter()
             .map(|&r| {
-                let raw = table.cell(r, col);
-                if raw.is_empty() {
+                // Genuine nulls are detected from the data, not from the
+                // rendered string, so an empty-but-present value is not a null.
+                if table.is_null(r, col) {
                     SortKey::Null
                 } else if numeric {
-                    match raw.replace(',', "").parse::<f64>() {
-                        Ok(v) => SortKey::Num(v),
-                        Err(_) => SortKey::Text(raw.to_lowercase()),
-                    }
+                    SortKey::numeric(&table.cell(r, col))
                 } else {
-                    SortKey::Text(raw.to_lowercase())
+                    SortKey::Text(table.cell(r, col).to_lowercase())
                 }
             })
             .collect();
 
         let mut idx: Vec<usize> = (0..self.visible.len()).collect();
         idx.sort_by(|&a, &b| {
-            let ord = keys[a].cmp(&keys[b]);
-            match dir {
-                SortDir::Ascending => ord,
-                SortDir::Descending => ord.reverse(),
+            let (ka, kb) = (&keys[a], &keys[b]);
+            // Nulls always sort last, regardless of ascending/descending.
+            match (ka.is_null(), kb.is_null()) {
+                (true, true) => std::cmp::Ordering::Equal,
+                (true, false) => std::cmp::Ordering::Greater,
+                (false, true) => std::cmp::Ordering::Less,
+                (false, false) => {
+                    let ord = ka.cmp(kb);
+                    match dir {
+                        SortDir::Ascending => ord,
+                        SortDir::Descending => ord.reverse(),
+                    }
+                }
             }
         });
         self.visible = idx.into_iter().map(|i| self.visible[i]).collect();
@@ -562,13 +569,14 @@ impl App {
             let (mut count, mut nulls, mut numok) = (0usize, 0usize, 0usize);
             let (mut min, mut max, mut sum) = (f64::INFINITY, f64::NEG_INFINITY, 0.0f64);
             for r in 0..rows {
-                let s = formatters[c].value(r).to_string();
-                if s.is_empty() {
+                // A genuine null (not an empty-but-present value) is a null.
+                if table.is_null(r, c) {
                     nulls += 1;
                     continue;
                 }
                 count += 1;
                 if numeric {
+                    let s = formatters[c].value(r).to_string();
                     if let Ok(v) = s.replace(',', "").parse::<f64>() {
                         min = min.min(v);
                         max = max.max(v);
@@ -636,32 +644,15 @@ impl App {
     }
 
     /// Write the current (filtered + sorted) view to a CSV file next to the
-    /// source, so what you see is what you save.
+    /// source, so what you see is what you save. Never overwrites an existing
+    /// file: a numbered suffix is added if needed. Rows are streamed to disk
+    /// rather than built up in one big string.
     fn export_view(&mut self) {
         let Some(table) = &self.table else { return };
         let cols = table.num_cols();
-        let names = table.column_names();
 
-        let mut out = String::new();
-        out.push_str(
-            &names
-                .iter()
-                .map(|s| csv_escape(s))
-                .collect::<Vec<_>>()
-                .join(","),
-        );
-        out.push('\n');
-        for &r in &self.visible {
-            let line = (0..cols)
-                .map(|c| csv_escape(&table.cell(r, c)))
-                .collect::<Vec<_>>()
-                .join(",");
-            out.push_str(&line);
-            out.push('\n');
-        }
-
-        let dest = export_path(&table.path);
-        match fs::write(&dest, out) {
+        let dest = unique_path(&export_path(&table.path));
+        match self.write_view(table, cols, &dest) {
             Ok(()) => {
                 self.status = Some(format!(
                     "exported {} rows → {}",
@@ -672,20 +663,65 @@ impl App {
             Err(e) => self.status = Some(format!("export failed: {e}")),
         }
     }
+
+    fn write_view(&self, table: &Table, cols: usize, dest: &Path) -> std::io::Result<()> {
+        use std::io::Write;
+        let file = fs::File::create(dest)?;
+        let mut w = std::io::BufWriter::new(file);
+
+        let header = table
+            .column_names()
+            .iter()
+            .map(|s| csv_escape(s))
+            .collect::<Vec<_>>()
+            .join(",");
+        writeln!(w, "{header}")?;
+        for &r in &self.visible {
+            let line = (0..cols)
+                .map(|c| csv_escape(&table.cell(r, c)))
+                .collect::<Vec<_>>()
+                .join(",");
+            writeln!(w, "{line}")?;
+        }
+        w.flush()
+    }
 }
 
 /// A comparable sort key that orders nulls last and numbers numerically.
-#[derive(PartialEq)]
+///
+/// Integers are kept as `i128` so large values keep full precision — parsing
+/// them through `f64` would make e.g. 9007199254740992 and 9007199254740993
+/// compare equal.
+#[derive(Debug, PartialEq)]
 enum SortKey {
+    Int(i128),
     Num(f64),
     Text(String),
     Null,
 }
 
 impl SortKey {
+    /// Build a numeric key from a rendered cell: exact `i128` when possible,
+    /// otherwise `f64`, falling back to text for anything unparseable.
+    fn numeric(raw: &str) -> SortKey {
+        let cleaned = raw.replace(',', "");
+        if let Ok(i) = cleaned.parse::<i128>() {
+            SortKey::Int(i)
+        } else if let Ok(f) = cleaned.parse::<f64>() {
+            SortKey::Num(f)
+        } else {
+            SortKey::Text(raw.to_lowercase())
+        }
+    }
+
+    fn is_null(&self) -> bool {
+        matches!(self, SortKey::Null)
+    }
+
+    /// Rank for ordering across kinds: numbers < text < null.
     fn rank(&self) -> u8 {
         match self {
-            SortKey::Num(_) => 0,
+            SortKey::Int(_) | SortKey::Num(_) => 0,
             SortKey::Text(_) => 1,
             SortKey::Null => 2,
         }
@@ -696,10 +732,15 @@ impl Eq for SortKey {}
 
 impl Ord for SortKey {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        use std::cmp::Ordering::Equal;
         match (self, other) {
-            (SortKey::Num(a), SortKey::Num(b)) => a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal),
+            (SortKey::Int(a), SortKey::Int(b)) => a.cmp(b),
+            (SortKey::Num(a), SortKey::Num(b)) => a.partial_cmp(b).unwrap_or(Equal),
+            // Mixed int/float within one column: compare as floats.
+            (SortKey::Int(a), SortKey::Num(b)) => (*a as f64).partial_cmp(b).unwrap_or(Equal),
+            (SortKey::Num(a), SortKey::Int(b)) => a.partial_cmp(&(*b as f64)).unwrap_or(Equal),
             (SortKey::Text(a), SortKey::Text(b)) => a.cmp(b),
-            // Different kinds: order by rank (num < text < null).
+            // Different kinds: order by rank (number < text < null).
             _ => self.rank().cmp(&other.rank()),
         }
     }
@@ -728,6 +769,28 @@ pub(crate) fn export_path(src: &Path) -> PathBuf {
         Some(dir) if !dir.as_os_str().is_empty() => dir.join(name),
         _ => PathBuf::from(name),
     }
+}
+
+/// Return `base` if it doesn't exist yet, otherwise the first free
+/// `<stem>.N.<ext>` variant — so an export never clobbers an existing file.
+pub(crate) fn unique_path(base: &Path) -> PathBuf {
+    if !base.exists() {
+        return base.to_path_buf();
+    }
+    let dir = base.parent();
+    let stem = base.file_stem().and_then(|s| s.to_str()).unwrap_or("export");
+    let ext = base.extension().and_then(|s| s.to_str()).unwrap_or("csv");
+    for n in 1.. {
+        let name = format!("{stem}.{n}.{ext}");
+        let candidate = match dir {
+            Some(d) if !d.as_os_str().is_empty() => d.join(&name),
+            _ => PathBuf::from(&name),
+        };
+        if !candidate.exists() {
+            return candidate;
+        }
+    }
+    unreachable!("an unused filename always exists")
 }
 
 // ---- file browser ------------------------------------------------------
@@ -866,4 +929,46 @@ fn compute_widths(table: &Table) -> Vec<u16> {
         widths.push(w.clamp(MIN_W, MAX_W) as u16);
     }
     widths
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::cmp::Ordering;
+
+    #[test]
+    fn sort_keys_keep_large_integer_precision() {
+        // Beyond 2^53 these are indistinguishable as f64, but must compare
+        // correctly as exact integers.
+        let a = SortKey::numeric("9007199254740992");
+        let b = SortKey::numeric("9007199254740993");
+        assert!(matches!(a, SortKey::Int(_)));
+        assert_eq!(a.cmp(&b), Ordering::Less);
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn nulls_rank_after_values() {
+        assert_eq!(SortKey::numeric("1").cmp(&SortKey::Null), Ordering::Less);
+        assert_eq!(
+            SortKey::Text("z".into()).cmp(&SortKey::Null),
+            Ordering::Less
+        );
+    }
+
+    #[test]
+    fn unique_path_avoids_overwrite() {
+        let mut base = std::env::temp_dir();
+        base.push(format!("tessera_unique_{}.view.csv", std::process::id()));
+
+        // Nothing there yet → returns the base path.
+        assert_eq!(unique_path(&base), base);
+
+        // Once it exists, the next call picks a numbered variant.
+        std::fs::write(&base, "x").unwrap();
+        let next = unique_path(&base);
+        assert_ne!(next, base);
+        assert!(next.to_string_lossy().contains(".1."));
+        std::fs::remove_file(&base).ok();
+    }
 }

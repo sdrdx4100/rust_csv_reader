@@ -8,7 +8,6 @@
 //! lists, structs, …) for free.
 
 use std::fs::File;
-use std::io::{Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -138,6 +137,13 @@ impl Table {
         &self.column_types
     }
 
+    /// Whether the cell at `(row, col)` is a genuine null (as opposed to an
+    /// empty-but-present value). Used so sorting and statistics can tell the
+    /// two apart.
+    pub fn is_null(&self, row: usize, col: usize) -> bool {
+        self.batch.column(col).is_null(row)
+    }
+
     /// Construct a display formatter for every column. Formatters borrow the
     /// underlying arrays, so they must not outlive the table.
     pub fn formatters(&self) -> Result<Vec<ArrayFormatter<'_>>> {
@@ -178,6 +184,7 @@ fn sniff_kind(path: &Path) -> Option<FileKind> {
 
 fn load_csv(path: &Path, opts: &LoadOptions) -> Result<(SchemaRef, Vec<RecordBatch>)> {
     use arrow::csv::reader::Format;
+    use arrow::datatypes::{Field, Schema};
 
     let format = Format::default()
         .with_header(opts.has_header)
@@ -188,18 +195,43 @@ fn load_csv(path: &Path, opts: &LoadOptions) -> Result<(SchemaRef, Vec<RecordBat
     let (schema, _) = format
         .infer_schema(&mut file, Some(opts.infer_rows))
         .context("failed to infer CSV schema")?;
-    file.seek(SeekFrom::Start(0))?;
-
     let schema = Arc::new(schema);
-    let reader = arrow::csv::ReaderBuilder::new(schema.clone())
-        .with_format(format)
+
+    // Type inference only samples the first `infer_rows` rows, so a column that
+    // looks numeric early can still contain text further down and break the
+    // typed read. If that happens, fall back to reading every column as text so
+    // the file always opens.
+    match read_csv_with_schema(path, &format, schema.clone()) {
+        Ok(batches) => Ok((schema, batches)),
+        Err(_) => {
+            let string_schema = Arc::new(Schema::new(
+                schema
+                    .fields()
+                    .iter()
+                    .map(|f| Field::new(f.name(), DataType::Utf8, true))
+                    .collect::<Vec<_>>(),
+            ));
+            let batches = read_csv_with_schema(path, &format, string_schema.clone())
+                .context("failed to read CSV data")?;
+            Ok((string_schema, batches))
+        }
+    }
+}
+
+/// Read every batch of a CSV file with a fixed schema, opening the file fresh.
+fn read_csv_with_schema(
+    path: &Path,
+    format: &arrow::csv::reader::Format,
+    schema: SchemaRef,
+) -> Result<Vec<RecordBatch>> {
+    let file = File::open(path).with_context(|| format!("failed to open {}", path.display()))?;
+    let reader = arrow::csv::ReaderBuilder::new(schema)
+        .with_format(format.clone())
         .build(file)
         .context("failed to build CSV reader")?;
-
-    let batches = reader
+    reader
         .collect::<std::result::Result<Vec<_>, _>>()
-        .context("failed to read CSV data")?;
-    Ok((schema, batches))
+        .context("failed to read CSV data")
 }
 
 fn load_parquet(path: &Path) -> Result<(SchemaRef, Vec<RecordBatch>)> {
@@ -349,6 +381,63 @@ mod tests {
         let table = Table::load(&path, &LoadOptions::default()).unwrap();
         assert_eq!(table.kind, FileKind::Csv);
         assert_eq!(table.num_cols(), 2);
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn csv_falls_back_to_strings_when_inference_is_wrong() {
+        // "v" looks numeric in the sampled rows, then turns out to hold text.
+        let path = temp_path("mixed.csv");
+        let mut f = File::create(&path).unwrap();
+        writeln!(f, "id,v").unwrap();
+        writeln!(f, "1,10").unwrap();
+        writeln!(f, "2,20").unwrap();
+        writeln!(f, "3,abc").unwrap();
+        f.flush().unwrap();
+
+        // Only sample the first 2 data rows so inference guesses int for "v".
+        let opts = LoadOptions {
+            infer_rows: 2,
+            ..Default::default()
+        };
+        let table = Table::load(&path, &opts).unwrap();
+        assert_eq!(table.num_rows(), 3);
+        // The whole column fell back to strings, so the text row survives.
+        assert_eq!(table.column_types()[1], "string");
+        assert_eq!(table.cell(2, 1), "abc");
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn distinguishes_null_from_empty_string() {
+        use arrow::array::StringArray;
+        use arrow::datatypes::{Field, Schema};
+        use parquet::arrow::ArrowWriter;
+
+        let path = temp_path("nulls.parquet");
+        let schema = Arc::new(Schema::new(vec![Field::new("s", DataType::Utf8, true)]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(StringArray::from(vec![Some("x"), Some(""), None]))],
+        )
+        .unwrap();
+        {
+            let file = File::create(&path).unwrap();
+            let mut writer = ArrowWriter::try_new(file, schema, None).unwrap();
+            writer.write(&batch).unwrap();
+            writer.close().unwrap();
+        }
+
+        let table = Table::load(&path, &LoadOptions::default()).unwrap();
+        // Row 1 is an empty-but-present value; row 2 is a genuine null. Both
+        // render as "", but only row 2 reports as null.
+        assert_eq!(table.cell(1, 0), "");
+        assert_eq!(table.cell(2, 0), "");
+        assert!(!table.is_null(0, 0));
+        assert!(!table.is_null(1, 0));
+        assert!(table.is_null(2, 0));
 
         std::fs::remove_file(&path).ok();
     }
