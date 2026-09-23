@@ -2,10 +2,68 @@
 
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::mpsc::{self, Receiver, TryRecvError};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind};
 
-use crate::data::{is_numeric_type, FileKind, LoadOptions, Table};
+use crate::data::{inspect, is_numeric_type, read_head, FileKind, LoadOptions, StreamLimits, Table};
+use crate::sql::{SqlEngine, SqlTable};
+
+/// Rows read up front to preview a file that is too big to load.
+pub const PREVIEW_ROWS: usize = 1_000;
+
+/// Most rows an SQL result keeps on screen. Use `tessera FILE -q SQL --csv` to
+/// get every row of a bigger result.
+pub const SQL_ROW_CAP: usize = 100_000;
+
+/// SQL words offered by Tab completion (column names are added per file).
+const SQL_WORDS: &[&str] = &[
+    "SELECT", "FROM", "WHERE", "AND", "OR", "NOT", "LIKE", "ILIKE", "IN", "IS", "NULL",
+    "BETWEEN", "ORDER", "BY", "GROUP", "HAVING", "LIMIT", "OFFSET", "DESC", "ASC",
+    "DISTINCT", "COUNT", "SUM", "AVG", "MIN", "MAX", "AS",
+];
+
+/// The file that is open — loaded into memory, or only reachable through SQL.
+#[derive(Debug, Clone)]
+pub struct Source {
+    pub path: PathBuf,
+    pub kind: FileKind,
+    /// Known for loaded files and Parquet; `None` for a streamed CSV.
+    pub rows: Option<usize>,
+    pub cols: Option<usize>,
+    /// True when the file was too big to load and is browsed with SQL only.
+    pub streamed: bool,
+}
+
+/// A finished background query, sent back to the UI thread.
+struct SqlDone {
+    engine: Option<Arc<SqlEngine>>,
+    query: String,
+    result: Result<SqlTable, String>,
+}
+
+/// State of the SQL prompt (`S`) and of the query results on screen.
+#[derive(Default)]
+pub struct SqlUi {
+    /// The query being edited and the cursor position in it (in characters).
+    pub input: String,
+    pub cursor: usize,
+    history: Vec<String>,
+    hist_pos: Option<usize>,
+    /// Completion candidates from the last Tab press, shown under the prompt.
+    pub suggestions: Vec<String>,
+    /// The query whose result is currently on screen, if any.
+    pub shown: Option<String>,
+    pub truncated: bool,
+    pub elapsed: Option<Duration>,
+    pub error: Option<String>,
+    /// When the running query started (`None` when idle).
+    pub started: Option<Instant>,
+    pending: Option<Receiver<SqlDone>>,
+    engine: Option<Arc<SqlEngine>>,
+}
 
 /// Interaction modes the viewer can be in.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -24,6 +82,8 @@ pub enum Mode {
     Cell,
     /// Built-in file browser for opening another file.
     Browser,
+    /// Typing an SQL query in the prompt at the bottom of the screen.
+    Sql,
 }
 
 /// Sort direction applied to the current view.
@@ -52,10 +112,22 @@ pub struct NumStats {
 }
 
 pub struct App {
-    /// The currently open table, or `None` when only the file browser is shown.
+    /// The table on screen: the loaded file or an SQL result. `None` while a
+    /// streamed file's first query is still running (or nothing is open).
     pub table: Option<Table>,
+    /// The open file, whether loaded or streamed.
+    pub source: Option<Source>,
+    /// The loaded file's table, set aside while an SQL result is shown so `Esc`
+    /// can return to it.
+    saved: Option<Table>,
+    /// SQL prompt and query state.
+    pub sql: SqlUi,
     /// Load options reused when opening files from the browser.
     pub opts: LoadOptions,
+    /// Size limits above which files are streamed instead of loaded.
+    pub limits: StreamLimits,
+    /// Always stream (`--sql-only`), whatever the file size.
+    pub force_stream: bool,
 
     /// Row indices (into the table) currently visible, honouring filter & sort.
     pub visible: Vec<usize>,
@@ -102,6 +174,13 @@ impl App {
             .map(Path::to_path_buf)
             .unwrap_or_else(|| PathBuf::from("."));
         let mut app = App::bare(opts, cwd);
+        app.source = Some(Source {
+            path: table.path.clone(),
+            kind: table.kind,
+            rows: Some(table.num_rows()),
+            cols: Some(table.num_cols()),
+            streamed: false,
+        });
         app.set_table(table);
         app
     }
@@ -116,7 +195,12 @@ impl App {
     fn bare(opts: LoadOptions, cwd: PathBuf) -> App {
         App {
             table: None,
+            source: None,
+            saved: None,
+            sql: SqlUi::default(),
             opts,
+            limits: StreamLimits::default(),
+            force_stream: false,
             visible: Vec::new(),
             filter: None,
             sort: None,
@@ -154,22 +238,231 @@ impl App {
         self.input.clear();
     }
 
-    /// Load `path` with the current options; on success switch to it, otherwise
-    /// surface the error in the browser.
+    /// Open `path`: small files are loaded into memory; files over the size
+    /// limits (or any file with `force_stream`) are *streamed* — never loaded,
+    /// only queried with SQL — so they can't exhaust memory. On failure the
+    /// error is shown in the file browser instead of quitting.
     pub fn open_path(&mut self, path: PathBuf) {
+        let info = match inspect(&path, self.opts.kind, &self.limits) {
+            Ok(info) => info,
+            Err(e) => return self.fail_open(e),
+        };
+        if info.stream || self.force_stream {
+            self.open_streamed(path, info.kind, info.rows, info.cols);
+            return;
+        }
         match Table::load(&path, &self.opts) {
             Ok(table) => {
+                self.reset_for_new_file();
+                self.source = Some(Source {
+                    path: path.clone(),
+                    kind: table.kind,
+                    rows: Some(table.num_rows()),
+                    cols: Some(table.num_cols()),
+                    streamed: false,
+                });
                 self.set_table(table);
                 self.mode = Mode::Normal;
+                self.status = Some(format!("opened {}", file_name(&path)));
+            }
+            Err(e) => self.fail_open(e),
+        }
+    }
+
+    fn fail_open(&mut self, e: anyhow::Error) {
+        self.browser.error = Some(crate::error_text(&e));
+        self.mode = Mode::Browser;
+    }
+
+    /// Open a too-big file in SQL mode: only its first rows are read, as a
+    /// preview; everything else is reached with SQL queries.
+    fn open_streamed(&mut self, path: PathBuf, kind: FileKind, rows: Option<usize>, mut cols: Option<usize>) {
+        self.reset_for_new_file();
+        self.clear_table();
+        self.mode = Mode::Normal;
+        match read_head(&path, &self.opts, PREVIEW_ROWS) {
+            Ok(head) => {
+                cols = cols.or(Some(head.num_cols()));
+                self.set_table(head);
                 self.status = Some(format!(
-                    "opened {}",
-                    path.file_name().and_then(|s| s.to_str()).unwrap_or("?")
+                    "large file: showing the first {} rows — press S to search all of it with SQL",
+                    group_digits(PREVIEW_ROWS)
                 ));
             }
+            Err(e) => self.sql.error = Some(crate::error_text(&e)),
+        }
+        self.source = Some(Source {
+            path,
+            kind,
+            rows,
+            cols,
+            streamed: true,
+        });
+    }
+
+    /// True when the table on screen is the preview of a streamed file.
+    pub fn showing_preview(&self) -> bool {
+        self.sql.shown.is_none() && self.table.is_some() && self.source.as_ref().is_some_and(|s| s.streamed)
+    }
+
+    /// Forget everything tied to the previous file (SQL session, results).
+    fn reset_for_new_file(&mut self) {
+        self.saved = None;
+        let history = std::mem::take(&mut self.sql.history);
+        self.sql = SqlUi {
+            history,
+            ..SqlUi::default()
+        };
+    }
+
+    fn clear_table(&mut self) {
+        self.table = None;
+        self.visible.clear();
+        self.col_widths.clear();
+        self.filter = None;
+        self.sort = None;
+        self.row_text = None;
+        self.stats = None;
+        self.sel_row = 0;
+        self.sel_col = 0;
+        self.row_off = 0;
+        self.col_off = 0;
+    }
+
+    /// True while an SQL query runs in the background.
+    pub fn sql_running(&self) -> bool {
+        self.sql.pending.is_some()
+    }
+
+    /// Whether `Esc` would go back from an SQL result to the loaded file.
+    pub fn can_go_back(&self) -> bool {
+        self.sql.shown.is_some() && self.saved.is_some()
+    }
+
+    /// Column names to offer for completion and hints: the file's own columns
+    /// when known, otherwise those of the result on screen.
+    pub fn sql_columns(&self) -> Vec<String> {
+        self.saved
+            .as_ref()
+            .or(self.table.as_ref())
+            .map(|t| t.column_names().to_vec())
+            .unwrap_or_default()
+    }
+
+    fn set_sql_input(&mut self, text: String) {
+        self.sql.cursor = text.chars().count();
+        self.sql.input = text;
+    }
+
+    /// Start running the prompt's query on a background thread.
+    pub fn run_sql(&mut self) {
+        let Some(src) = &self.source else {
+            self.sql.error = Some("open a file first".into());
+            return;
+        };
+        let query = self.sql.input.trim().to_string();
+        if query.is_empty() {
+            return;
+        }
+        if self.sql.history.last() != Some(&query) {
+            self.sql.history.push(query.clone());
+        }
+        self.sql.hist_pos = None;
+        self.sql.suggestions.clear();
+        self.sql.error = None;
+
+        let (path, kind) = (src.path.clone(), src.kind);
+        let (delimiter, header) = (self.opts.delimiter, self.opts.has_header);
+        let engine = self.sql.engine.clone();
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let engine = match engine {
+                Some(e) => Ok(e),
+                None => SqlEngine::new(&path, kind, delimiter, header).map(Arc::new),
+            };
+            let done = match engine {
+                Ok(engine) => SqlDone {
+                    result: engine.query_table(&query, SQL_ROW_CAP).map_err(|e| crate::error_text(&e)),
+                    engine: Some(engine),
+                    query,
+                },
+                Err(e) => SqlDone {
+                    engine: None,
+                    query,
+                    result: Err(crate::error_text(&e)),
+                },
+            };
+            let _ = tx.send(done);
+        });
+        self.sql.pending = Some(rx);
+        self.sql.started = Some(Instant::now());
+    }
+
+    /// Pick up a finished background query, if any. Call regularly from the
+    /// event loop; returns true while a query is still running.
+    pub fn tick(&mut self) -> bool {
+        let Some(rx) = &self.sql.pending else {
+            return false;
+        };
+        let done = match rx.try_recv() {
+            Ok(done) => done,
+            Err(TryRecvError::Empty) => return true,
+            Err(TryRecvError::Disconnected) => SqlDone {
+                engine: None,
+                query: String::new(),
+                result: Err("the query stopped unexpectedly".into()),
+            },
+        };
+        self.sql.pending = None;
+        self.sql.elapsed = self.sql.started.take().map(|t| t.elapsed());
+        if let Some(engine) = done.engine {
+            self.sql.engine = Some(engine);
+        }
+        match done.result {
+            Ok(res) => {
+                // Put the loaded file aside (once) so Esc can come back to it.
+                if self.sql.shown.is_none() {
+                    if let Some(t) = self.table.take() {
+                        self.saved = Some(t);
+                    }
+                }
+                self.set_table(res.table);
+                self.sql.shown = Some(done.query);
+                self.sql.truncated = res.truncated;
+                self.sql.error = None;
+            }
             Err(e) => {
-                self.browser.error = Some(format!("{e:#}"));
+                // Reopen the prompt so the query can be fixed right away.
+                self.sql.error = Some(e);
+                self.mode = Mode::Sql;
             }
         }
+        false
+    }
+
+    /// Leave an SQL result and show the loaded file again.
+    fn go_back(&mut self) {
+        if let Some(t) = self.saved.take() {
+            self.set_table(t);
+            self.sql.shown = None;
+            self.sql.truncated = false;
+            self.status = Some(if self.showing_preview() {
+                "back to the preview".into()
+            } else {
+                "back to the file".into()
+            });
+        }
+    }
+
+    fn open_sql_prompt(&mut self) {
+        if self.source.is_none() {
+            return;
+        }
+        if self.sql.input.trim().is_empty() {
+            self.set_sql_input(format!("SELECT * FROM {} WHERE ", SqlEngine::TABLE));
+        }
+        self.sql.suggestions.clear();
+        self.mode = Mode::Sql;
     }
 
     pub fn num_cols(&self) -> usize {
@@ -204,12 +497,13 @@ impl App {
 
     pub fn on_key(&mut self, key: KeyEvent) {
         self.status = None;
-        // Safety: never sit in a table mode without a table loaded.
-        if self.table.is_none() && self.mode != Mode::Browser {
+        // Safety: never sit in a table mode with no file open.
+        if self.source.is_none() && self.mode != Mode::Browser {
             self.mode = Mode::Browser;
         }
         match self.mode {
             Mode::Normal => self.on_key_normal(key),
+            Mode::Sql => self.on_key_sql(key),
             Mode::Search => self.on_key_search(key),
             Mode::Goto => self.on_key_goto(key),
             Mode::Browser => self.on_key_browser(key),
@@ -228,8 +522,17 @@ impl App {
     fn on_key_normal(&mut self, key: KeyEvent) {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         match key.code {
+            // Esc leaves an SQL result first (never quits from one — a large
+            // file has no plain view to go back to); otherwise, like q, it quits.
+            KeyCode::Esc if self.can_go_back() => self.go_back(),
+            KeyCode::Esc if self.sql.shown.is_some() => {
+                self.status = Some("press S for a new query, q to quit".into());
+            }
             KeyCode::Char('q') | KeyCode::Esc => self.should_quit = true,
             KeyCode::Char('c') if ctrl => self.should_quit = true,
+
+            // SQL prompt.
+            KeyCode::Char('S') | KeyCode::F(5) => self.open_sql_prompt(),
 
             // Cursor movement.
             KeyCode::Char('j') | KeyCode::Down => self.move_row(1),
@@ -288,6 +591,120 @@ impl App {
             }
             _ => {}
         }
+    }
+
+    fn on_key_sql(&mut self, key: KeyEvent) {
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        let len = self.sql.input.chars().count();
+        if key.code != KeyCode::Tab {
+            self.sql.suggestions.clear();
+        }
+        match key.code {
+            KeyCode::Char('c') if ctrl => self.should_quit = true,
+            KeyCode::Esc => self.mode = Mode::Normal,
+            KeyCode::Enter => {
+                self.mode = Mode::Normal;
+                self.run_sql();
+            }
+            KeyCode::Char('u') if ctrl => self.set_sql_input(String::new()),
+            KeyCode::Left => self.sql.cursor = self.sql.cursor.saturating_sub(1),
+            KeyCode::Right => self.sql.cursor = (self.sql.cursor + 1).min(len),
+            KeyCode::Home => self.sql.cursor = 0,
+            KeyCode::Char('a') if ctrl => self.sql.cursor = 0,
+            KeyCode::End => self.sql.cursor = len,
+            KeyCode::Char('e') if ctrl => self.sql.cursor = len,
+            KeyCode::Backspace => {
+                if self.sql.cursor > 0 {
+                    let at = byte_index(&self.sql.input, self.sql.cursor - 1);
+                    self.sql.input.remove(at);
+                    self.sql.cursor -= 1;
+                }
+            }
+            KeyCode::Delete => {
+                if self.sql.cursor < len {
+                    let at = byte_index(&self.sql.input, self.sql.cursor);
+                    self.sql.input.remove(at);
+                }
+            }
+            KeyCode::Up => self.history_step(-1),
+            KeyCode::Down => self.history_step(1),
+            KeyCode::Tab => self.complete_sql(),
+            KeyCode::Char(c) => {
+                let at = byte_index(&self.sql.input, self.sql.cursor);
+                self.sql.input.insert(at, c);
+                self.sql.cursor += 1;
+            }
+            _ => {}
+        }
+    }
+
+    /// Walk the query history (Up = older, Down = newer).
+    fn history_step(&mut self, delta: isize) {
+        let n = self.sql.history.len();
+        if n == 0 {
+            return;
+        }
+        let next = match (self.sql.hist_pos, delta < 0) {
+            (None, true) => Some(n - 1),
+            (None, false) => None,
+            (Some(i), true) => Some(i.saturating_sub(1)),
+            (Some(i), false) if i + 1 < n => Some(i + 1),
+            (Some(_), false) => None,
+        };
+        self.sql.hist_pos = next;
+        let text = next.map(|i| self.sql.history[i].clone()).unwrap_or_default();
+        self.set_sql_input(text);
+    }
+
+    /// Tab-complete the word before the cursor from the file's column names,
+    /// the table name and common SQL words. One match is inserted; several are
+    /// listed under the prompt (and their common prefix is filled in).
+    fn complete_sql(&mut self) {
+        let chars: Vec<char> = self.sql.input.chars().collect();
+        let end = self.sql.cursor.min(chars.len());
+        let mut start = end;
+        while start > 0 && is_ident_char(chars[start - 1]) {
+            start -= 1;
+        }
+        let word: String = chars[start..end].iter().collect();
+        if word.is_empty() {
+            // Nothing typed yet: just show what's available.
+            self.sql.suggestions = self.sql_columns().iter().map(|c| sql_ident(c)).collect();
+            return;
+        }
+        let lower = word.to_lowercase();
+        let mut cands: Vec<String> = self
+            .sql_columns()
+            .iter()
+            .filter(|c| c.to_lowercase().starts_with(&lower))
+            .map(|c| sql_ident(c))
+            .collect();
+        if SqlEngine::TABLE.starts_with(&lower) {
+            cands.push(SqlEngine::TABLE.to_string());
+        }
+        cands.extend(
+            SQL_WORDS
+                .iter()
+                .filter(|w| w.to_lowercase().starts_with(&lower))
+                .map(|w| w.to_string()),
+        );
+        cands.dedup();
+        let replacement = match cands.len() {
+            0 => return,
+            1 => format!("{} ", cands[0]),
+            _ => {
+                let common = common_prefix_ci(&cands);
+                self.sql.suggestions = cands;
+                if common.chars().count() <= word.chars().count() {
+                    return;
+                }
+                common
+            }
+        };
+        let before: String = chars[..start].iter().collect();
+        let after: String = chars[end..].iter().collect();
+        self.sql.cursor = before.chars().count() + replacement.chars().count();
+        self.sql.input = format!("{before}{replacement}{after}");
     }
 
     fn on_key_search(&mut self, key: KeyEvent) {
@@ -752,6 +1169,62 @@ impl PartialOrd for SortKey {
     }
 }
 
+fn file_name(path: &Path) -> &str {
+    path.file_name().and_then(|s| s.to_str()).unwrap_or("?")
+}
+
+/// Byte offset of the `ch`-th character (or the end of the string).
+fn byte_index(s: &str, ch: usize) -> usize {
+    s.char_indices().nth(ch).map_or(s.len(), |(i, _)| i)
+}
+
+fn is_ident_char(c: char) -> bool {
+    c.is_alphanumeric() || c == '_'
+}
+
+/// A column name as it must be written in SQL. DataFusion folds unquoted
+/// identifiers to lowercase, so names with capitals, spaces or symbols need
+/// double quotes.
+pub fn sql_ident(name: &str) -> String {
+    let plain = !name.is_empty()
+        && !name.starts_with(|c: char| c.is_ascii_digit())
+        && name.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_');
+    if plain {
+        name.to_string()
+    } else {
+        format!("\"{}\"", name.replace('"', "\"\""))
+    }
+}
+
+/// Longest prefix shared by all candidates (case-insensitive), in the casing
+/// of the first one.
+fn common_prefix_ci(cands: &[String]) -> String {
+    let first: Vec<char> = cands[0].chars().collect();
+    let mut n = first.len();
+    for c in &cands[1..] {
+        let m = c
+            .chars()
+            .zip(first.iter())
+            .take_while(|(a, b)| a.to_lowercase().eq(b.to_lowercase()))
+            .count();
+        n = n.min(m);
+    }
+    first[..n].iter().collect()
+}
+
+/// Format a count with thousands separators, e.g. 10000000 → "10,000,000".
+pub fn group_digits(n: usize) -> String {
+    let s = n.to_string();
+    let mut out = String::with_capacity(s.len() + s.len() / 3);
+    for (i, ch) in s.chars().enumerate() {
+        if i > 0 && (s.len() - i) % 3 == 0 {
+            out.push(',');
+        }
+        out.push(ch);
+    }
+    out
+}
+
 /// Quote a CSV field if it contains a comma, quote, or newline.
 fn csv_escape(s: &str) -> String {
     if s.contains([',', '"', '\n', '\r']) {
@@ -954,6 +1427,23 @@ mod tests {
             SortKey::Text("z".into()).cmp(&SortKey::Null),
             Ordering::Less
         );
+    }
+
+    #[test]
+    fn sql_ident_quotes_only_when_needed() {
+        assert_eq!(sql_ident("price"), "price");
+        assert_eq!(sql_ident("order_id2"), "order_id2");
+        assert_eq!(sql_ident("UserName"), "\"UserName\"");
+        assert_eq!(sql_ident("first name"), "\"first name\"");
+        assert_eq!(sql_ident("2col"), "\"2col\"");
+        assert_eq!(sql_ident("売上"), "\"売上\"");
+    }
+
+    #[test]
+    fn groups_digits() {
+        assert_eq!(group_digits(0), "0");
+        assert_eq!(group_digits(1000), "1,000");
+        assert_eq!(group_digits(12_000_000), "12,000,000");
     }
 
     #[test]

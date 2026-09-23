@@ -1,9 +1,11 @@
 # Tessera
 
-**An ultimate terminal viewer for CSV and Parquet files**, written in Rust.
+**A terminal viewer and SQL explorer for CSV and Parquet files**, written in Rust.
 
-Tessera opens large CSV and Parquet files in a fast, keyboard-driven TUI. The
-whole file is loaded into memory (so it's bounded by your RAM, not streamed).
+Tessera opens CSV and Parquet files in a fast, keyboard-driven TUI and lets you
+search them with SQL. Files that fit comfortably in memory are loaded whole;
+files too big for that (10M+ rows is fine) are never loaded — you get a preview
+of the first rows and query the rest with SQL, which streams through the file.
 Inputs are normalised through [Apache Arrow](https://arrow.apache.org/),
 so columns are correctly typed and every value — integers, floats, dates,
 timestamps, decimals, nested lists/structs — is rendered with Arrow's
@@ -24,6 +26,14 @@ type-aware formatter.
 
 - **CSV & Parquet** in one tool, auto-detected by extension or content (the
   Parquet `PAR1` magic header). Force it with `--type`.
+- **SQL** (`S`): query the file — it is the table `data` — with
+  [DataFusion](https://datafusion.apache.org/). Results show up as a normal
+  table you can sort, filter, copy and export; `Esc` goes back. Tab completes
+  column names, ↑/↓ recalls earlier queries.
+- **Huge files**: anything too big to load (see [below](#large-files)) opens in
+  SQL mode with a preview instead of running out of memory.
+- **One-shot queries** from the shell: `tessera data.parquet -q "SELECT …"`
+  prints a table; add `--csv` to stream every row as CSV.
 - **Built-in file browser** — run `tessera` with no arguments to pick a file,
   or press `o` any time to open another one without leaving the app.
 - **Typed columns** with schema inference for CSV; numeric columns are
@@ -98,10 +108,10 @@ on a background thread, so the window stays responsive during a long scan.
 
 ### Very large Parquet files
 
-Parquet files with more than 2 million rows are **not loaded into memory**.
-The GUI reads only the file's footer (row/column counts), opens straight into
-SQL mode and shows a `SELECT * FROM data LIMIT 1000` preview; DataFusion then
-streams through the file for each query. Search with `WHERE`, e.g.
+Files too big to load (see [Large files](#large-files)) are **not loaded into
+memory**. The GUI reads only the file's metadata, opens straight into SQL mode
+and shows the file's first 1,000 rows as a preview; DataFusion then streams
+through the file for each query. Search with `WHERE`, e.g.
 `SELECT * FROM data WHERE name LIKE '%foo%'`.
 
 Measured on a 12,000,000-row, 288 MB Parquet file (5 columns, 4-core Linux):
@@ -109,14 +119,15 @@ Measured on a 12,000,000-row, 288 MB Parquet file (5 columns, 4-core Linux):
 | Query | Time |
 | --- | --- |
 | open the file | < 1 ms |
-| `SELECT * FROM data LIMIT 1000` | 0.03 s |
+| first 1,000 rows (preview) | instant |
 | `SELECT COUNT(*) FROM data` | < 0.01 s |
 | `… WHERE name = 'user11999999'` (full scan) | 0.11 s |
 | `… WHERE name LIKE '%99999%'` | 0.26 s |
 | `GROUP BY category` with `COUNT`/`AVG` | 0.09 s |
 | `ORDER BY value DESC LIMIT 100` | 0.20 s |
 
-Peak memory stayed around 300 MB. (The terminal UI still loads files fully.)
+Peak memory stayed around 300 MB. The same size limits as the terminal viewer
+apply (see [Large files](#large-files)), so big CSV files open this way too.
 
 Prebuilt `tessera-gui` binaries ship in the **Windows** and **macOS** release
 archives alongside the TUI; on Linux, build it from source as above.
@@ -130,10 +141,60 @@ tessera data.parquet
 tessera --type csv mystery_file
 tessera --delimiter ';' euro.csv
 tessera --delimiter '\t' --no-header data.tsv
+tessera --sql-only big.csv   # never load it; browse with SQL only
+
+# one-shot SQL: print the result and exit (the file is the table `data`)
+tessera data.parquet -q "SELECT category, COUNT(*) FROM data GROUP BY category"
+tessera data.parquet -q "SELECT * FROM data WHERE price > 100" --csv > hits.csv
 
 # try the bundled sample
 tessera samples/people.csv
 ```
+
+If a file can't be opened, Tessera stays open and shows the error in its file
+browser (so on Windows the window doesn't just close).
+
+### SQL in the viewer
+
+Press **`S`** (or `F5`) to open the SQL prompt at the bottom of the screen. The
+open file is the table **`data`**; the prompt starts as
+`SELECT * FROM data WHERE ` so you only type the condition:
+
+```sql
+SELECT * FROM data WHERE name LIKE '%tanaka%'
+SELECT * FROM data WHERE amount > 1000 ORDER BY amount DESC
+SELECT city, COUNT(*) AS n, AVG(amount) FROM data GROUP BY city ORDER BY n DESC
+```
+
+- **Enter** runs the query in the background — the screen stays responsive and
+  the title bar shows the elapsed time, then the result's row count and time.
+- **Tab** completes column names, `data` and SQL keywords (several matches are
+  listed under the prompt). Column names with capitals, spaces or non-ASCII
+  characters are inserted in `"double quotes"`, as SQL requires.
+- **↑ / ↓** walk through earlier queries; **Ctrl-u** clears the line.
+- The prompt lists the file's columns; errors are shown in red and the prompt
+  stays open so you can fix the query.
+- The result is an ordinary table: sort (`s`), filter (`/`), inspect, copy and
+  export (`e`) it. **Esc** returns to the file (or its preview). Results show up
+  to 100,000 rows — use `-q … --csv` for more.
+
+### Large files
+
+A file is **not loaded** — only previewed, and queried with SQL — when it is a
+Parquet file with more than 2 million rows or more than 512 MB of uncompressed
+data, or a CSV file larger than 256 MB (`--sql-only` forces this for any file).
+Only the first 1,000 rows are read for the preview; each query streams through
+the file.
+
+Measured with the terminal viewer on a 12,000,000-row, 288 MB Parquet file
+(5 columns, 4-core Linux), with the process limited to 1 GB of memory:
+
+| | Time | Peak memory |
+| --- | --- | --- |
+| open (preview of the first 1,000 rows) | instant | 22 MB |
+| `GROUP BY category` over all rows | 0.21 s | 111 MB |
+| `WHERE name LIKE '%77777%' ORDER BY value DESC` | ≈0.3 s | ≈220 MB |
+| loading the whole file (the old behaviour) | 2.5 s | 1.2 GB — aborted under the 1 GB limit |
 
 On Windows you can also drag a `.csv`/`.parquet` file onto `tessera.exe`, or run
 it with no arguments and browse to the file from inside the app.
@@ -163,11 +224,13 @@ it with no arguments and browse to the file from inside the app.
 | `/` | Incremental filter across all columns |
 | `n` | Clear the active filter |
 | `:` | Go to a row number |
+| `S` / `F5` | SQL prompt (Enter run · Tab complete · ↑↓ history · Esc close) |
+| `Esc` | From an SQL result: back to the file / preview |
 | `o` | Open another file (file browser) |
 | `y` / `Y` | Copy current cell / row to the clipboard |
 | `e` | Export the current view to `<name>.view.csv` |
 | `?` | Toggle help |
-| `q` / `Esc` / `Ctrl-c` | Quit |
+| `q` / `Esc` / `Ctrl-c` | Quit (`Esc` goes back first when showing an SQL result) |
 
 In the **file browser**: `↑`/`↓` (or `j`/`k`) move, `Enter` opens a file or
 enters a folder, `Backspace` goes up a directory, and `q`/`Esc` returns to the
@@ -177,13 +240,16 @@ table (or quits if none is open).
 
 | Layer | File | Responsibility |
 | --- | --- | --- |
-| Data | `src/data.rs` | Load CSV/Parquet into a single Arrow `RecordBatch`; type-aware cell formatting. |
+| Data | `src/data.rs` | Load CSV/Parquet into a single Arrow `RecordBatch` (or just its first rows); decide which files are too big to load; type-aware cell formatting. |
+| SQL | `src/sql.rs` | DataFusion session over the file (table `data`); results as typed tables, pretty text or streamed CSV. |
 | State | `src/app.rs` | Selection, scrolling, filtering and all input handling. |
 | View | `src/ui.rs` | Hand-rolled grid rendering with a frozen header and overlays. |
 | Entry | `src/main.rs` | CLI parsing and terminal lifecycle. |
 
-The whole file is loaded into memory as one concatenated batch, giving O(1)
-random access to any cell and instant scrolling.
+A file that fits is loaded into memory as one concatenated batch, giving O(1)
+random access to any cell and instant scrolling. SQL results are moved from
+DataFusion's Arrow version to the app's through the Arrow IPC format, so they
+keep their column types.
 
 ## Development
 
