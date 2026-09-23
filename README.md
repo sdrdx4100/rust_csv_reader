@@ -93,7 +93,30 @@ table named `data`, so you can write things like
 SELECT name, score FROM data WHERE score > 100 ORDER BY score DESC LIMIT 50
 ```
 
-Results render in the same grid (capped at 100k rows for display).
+Results render in the same grid (capped at 100k rows for display). Queries run
+on a background thread, so the window stays responsive during a long scan.
+
+### Very large Parquet files
+
+Parquet files with more than 2 million rows are **not loaded into memory**.
+The GUI reads only the file's footer (row/column counts), opens straight into
+SQL mode and shows a `SELECT * FROM data LIMIT 1000` preview; DataFusion then
+streams through the file for each query. Search with `WHERE`, e.g.
+`SELECT * FROM data WHERE name LIKE '%foo%'`.
+
+Measured on a 12,000,000-row, 288 MB Parquet file (5 columns, 4-core Linux):
+
+| Query | Time |
+| --- | --- |
+| open the file | < 1 ms |
+| `SELECT * FROM data LIMIT 1000` | 0.03 s |
+| `SELECT COUNT(*) FROM data` | < 0.01 s |
+| `… WHERE name = 'user11999999'` (full scan) | 0.11 s |
+| `… WHERE name LIKE '%99999%'` | 0.26 s |
+| `GROUP BY category` with `COUNT`/`AVG` | 0.09 s |
+| `ORDER BY value DESC LIMIT 100` | 0.20 s |
+
+Peak memory stayed around 300 MB. (The terminal UI still loads files fully.)
 
 Prebuilt `tessera-gui` binaries ship in the **Windows** and **macOS** release
 archives alongside the TUI; on Linux, build it from source as above.

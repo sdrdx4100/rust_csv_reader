@@ -81,16 +81,12 @@ pub struct Table {
 impl Table {
     /// Load `path` according to `opts`, auto-detecting the format when needed.
     pub fn load(path: &Path, opts: &LoadOptions) -> Result<Table> {
-        let kind = opts
-            .kind
-            .or_else(|| FileKind::from_path(path))
-            .or_else(|| sniff_kind(path))
-            .ok_or_else(|| {
-                anyhow!(
-                    "could not determine file type for {}; pass --type csv|parquet",
-                    path.display()
-                )
-            })?;
+        let kind = detect_kind(path, opts.kind).ok_or_else(|| {
+            anyhow!(
+                "could not determine file type for {}; pass --type csv|parquet",
+                path.display()
+            )
+        })?;
 
         let (schema, batches) = match kind {
             FileKind::Csv => load_csv(path, opts)?,
@@ -166,6 +162,27 @@ impl Table {
             Err(_) => String::from("<err>"),
         }
     }
+}
+
+/// Work out how to interpret `path`: an explicit `forced` kind wins, then the
+/// file extension, then the file's leading bytes.
+pub fn detect_kind(path: &Path, forced: Option<FileKind>) -> Option<FileKind> {
+    forced
+        .or_else(|| FileKind::from_path(path))
+        .or_else(|| sniff_kind(path))
+}
+
+/// Row and column counts of a Parquet file, read from its footer metadata only.
+/// Cheap even for files with tens of millions of rows, since no data is decoded.
+pub fn parquet_shape(path: &Path) -> Result<(usize, usize)> {
+    use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+
+    let file = File::open(path)
+        .with_context(|| format!("failed to open {}", path.display()))?;
+    let builder = ParquetRecordBatchReaderBuilder::try_new(file)
+        .context("failed to open Parquet file")?;
+    let rows = builder.metadata().file_metadata().num_rows().max(0) as usize;
+    Ok((rows, builder.schema().fields().len()))
 }
 
 /// Peek at the first bytes of a file to recognise the Parquet magic header.
@@ -407,6 +424,36 @@ mod tests {
         assert_eq!(table.column_types()[1], "string");
         assert_eq!(table.cell(2, 1), "abc");
 
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn reads_parquet_shape_from_footer() {
+        use arrow::array::Int64Array;
+        use arrow::datatypes::{Field, Schema};
+        use parquet::arrow::ArrowWriter;
+
+        let path = temp_path("shape.parquet");
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("a", DataType::Int64, false),
+            Field::new("b", DataType::Int64, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int64Array::from((0..7).collect::<Vec<i64>>())),
+                Arc::new(Int64Array::from((0..7).collect::<Vec<i64>>())),
+            ],
+        )
+        .unwrap();
+        {
+            let file = File::create(&path).unwrap();
+            let mut writer = ArrowWriter::try_new(file, schema, None).unwrap();
+            writer.write(&batch).unwrap();
+            writer.close().unwrap();
+        }
+        assert_eq!(parquet_shape(&path).unwrap(), (7, 2));
+        assert_eq!(detect_kind(&path, None), Some(FileKind::Parquet));
         std::fs::remove_file(&path).ok();
     }
 
