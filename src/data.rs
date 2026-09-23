@@ -92,7 +92,17 @@ impl Table {
             FileKind::Csv => load_csv(path, opts)?,
             FileKind::Parquet => load_parquet(path)?,
         };
+        Table::from_batches(path, kind, schema, batches)
+    }
 
+    /// Build a table from already-decoded batches (e.g. an SQL query result).
+    /// `path` and `kind` describe the file the data came from.
+    pub fn from_batches(
+        path: &Path,
+        kind: FileKind,
+        schema: SchemaRef,
+        batches: Vec<RecordBatch>,
+    ) -> Result<Table> {
         let batch = if batches.is_empty() {
             RecordBatch::new_empty(schema.clone())
         } else {
@@ -107,7 +117,6 @@ impl Table {
             .map(|f| friendly_type(f.data_type()))
             .collect();
 
-        let _ = schema;
         Ok(Table {
             path: path.to_path_buf(),
             kind,
@@ -175,14 +184,89 @@ pub fn detect_kind(path: &Path, forced: Option<FileKind>) -> Option<FileKind> {
 /// Row and column counts of a Parquet file, read from its footer metadata only.
 /// Cheap even for files with tens of millions of rows, since no data is decoded.
 pub fn parquet_shape(path: &Path) -> Result<(usize, usize)> {
+    let (rows, cols, _) = parquet_footer(path)?;
+    Ok((rows, cols))
+}
+
+/// Rows, columns and total *uncompressed* data size, from the Parquet footer.
+fn parquet_footer(path: &Path) -> Result<(usize, usize, u64)> {
     use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 
     let file = File::open(path)
         .with_context(|| format!("failed to open {}", path.display()))?;
     let builder = ParquetRecordBatchReaderBuilder::try_new(file)
         .context("failed to open Parquet file")?;
-    let rows = builder.metadata().file_metadata().num_rows().max(0) as usize;
-    Ok((rows, builder.schema().fields().len()))
+    let meta = builder.metadata();
+    let rows = meta.file_metadata().num_rows().max(0) as usize;
+    let bytes = meta
+        .row_groups()
+        .iter()
+        .map(|rg| rg.total_byte_size().max(0) as u64)
+        .sum();
+    Ok((rows, builder.schema().fields().len(), bytes))
+}
+
+/// Size limits above which a file is *streamed* — never loaded into memory,
+/// only queried with SQL — so opening it can't exhaust RAM on a small machine.
+#[derive(Debug, Clone, Copy)]
+pub struct StreamLimits {
+    /// Parquet: more rows than this streams.
+    pub max_rows: usize,
+    /// Parquet: more uncompressed data than this streams (catches wide files).
+    pub max_parquet_bytes: u64,
+    /// CSV: a file larger than this on disk streams (its row count is unknown
+    /// without reading it all).
+    pub max_csv_bytes: u64,
+}
+
+impl Default for StreamLimits {
+    fn default() -> Self {
+        Self {
+            max_rows: 2_000_000,
+            max_parquet_bytes: 512 * 1024 * 1024,
+            max_csv_bytes: 256 * 1024 * 1024,
+        }
+    }
+}
+
+/// What can be learned about a file cheaply, before deciding how to open it.
+#[derive(Debug, Clone)]
+pub struct FileInfo {
+    pub kind: FileKind,
+    /// Known for Parquet (from the footer); `None` for CSV.
+    pub rows: Option<usize>,
+    pub cols: Option<usize>,
+    /// True when the file is too big to load and should be opened in SQL mode.
+    pub stream: bool,
+}
+
+/// Look at `path` without loading its data and decide whether to stream it.
+pub fn inspect(path: &Path, forced: Option<FileKind>, limits: &StreamLimits) -> Result<FileInfo> {
+    let kind = detect_kind(path, forced).ok_or_else(|| {
+        anyhow!("could not determine file type for {}", path.display())
+    })?;
+    match kind {
+        FileKind::Parquet => {
+            let (rows, cols, bytes) = parquet_footer(path)?;
+            Ok(FileInfo {
+                kind,
+                rows: Some(rows),
+                cols: Some(cols),
+                stream: rows > limits.max_rows || bytes > limits.max_parquet_bytes,
+            })
+        }
+        FileKind::Csv => {
+            let len = std::fs::metadata(path)
+                .with_context(|| format!("failed to open {}", path.display()))?
+                .len();
+            Ok(FileInfo {
+                kind,
+                rows: None,
+                cols: None,
+                stream: len > limits.max_csv_bytes,
+            })
+        }
+    }
 }
 
 /// Peek at the first bytes of a file to recognise the Parquet magic header.
@@ -200,6 +284,15 @@ fn sniff_kind(path: &Path) -> Option<FileKind> {
 }
 
 fn load_csv(path: &Path, opts: &LoadOptions) -> Result<(SchemaRef, Vec<RecordBatch>)> {
+    read_csv(path, opts, None)
+}
+
+/// Read a CSV file — all of it, or only the first `limit` rows.
+fn read_csv(
+    path: &Path,
+    opts: &LoadOptions,
+    limit: Option<usize>,
+) -> Result<(SchemaRef, Vec<RecordBatch>)> {
     use arrow::csv::reader::Format;
     use arrow::datatypes::{Field, Schema};
 
@@ -218,7 +311,7 @@ fn load_csv(path: &Path, opts: &LoadOptions) -> Result<(SchemaRef, Vec<RecordBat
     // looks numeric early can still contain text further down and break the
     // typed read. If that happens, fall back to reading every column as text so
     // the file always opens.
-    match read_csv_with_schema(path, &format, schema.clone()) {
+    match read_csv_with_schema(path, &format, schema.clone(), limit) {
         Ok(batches) => Ok((schema, batches)),
         Err(_) => {
             let string_schema = Arc::new(Schema::new(
@@ -228,27 +321,72 @@ fn load_csv(path: &Path, opts: &LoadOptions) -> Result<(SchemaRef, Vec<RecordBat
                     .map(|f| Field::new(f.name(), DataType::Utf8, true))
                     .collect::<Vec<_>>(),
             ));
-            let batches = read_csv_with_schema(path, &format, string_schema.clone())
+            let batches = read_csv_with_schema(path, &format, string_schema.clone(), limit)
                 .context("failed to read CSV data")?;
             Ok((string_schema, batches))
         }
     }
 }
 
-/// Read every batch of a CSV file with a fixed schema, opening the file fresh.
+/// Read the batches of a CSV file with a fixed schema (up to `limit` rows),
+/// opening the file fresh.
 fn read_csv_with_schema(
     path: &Path,
     format: &arrow::csv::reader::Format,
     schema: SchemaRef,
+    limit: Option<usize>,
 ) -> Result<Vec<RecordBatch>> {
     let file = File::open(path).with_context(|| format!("failed to open {}", path.display()))?;
-    let reader = arrow::csv::ReaderBuilder::new(schema)
-        .with_format(format.clone())
-        .build(file)
-        .context("failed to build CSV reader")?;
-    reader
-        .collect::<std::result::Result<Vec<_>, _>>()
-        .context("failed to read CSV data")
+    let mut builder = arrow::csv::ReaderBuilder::new(schema).with_format(format.clone());
+    if let Some(n) = limit {
+        builder = builder.with_batch_size(n.clamp(1, 8192));
+    }
+    let reader = builder.build(file).context("failed to build CSV reader")?;
+    let mut out = Vec::new();
+    let mut got = 0usize;
+    for batch in reader {
+        let batch = batch.context("failed to read CSV data")?;
+        match limit {
+            Some(n) if got + batch.num_rows() >= n => {
+                out.push(batch.slice(0, n - got));
+                break;
+            }
+            _ => {
+                got += batch.num_rows();
+                out.push(batch);
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Read only the first `n` rows of a file, in file order. Used to preview
+/// files that are too big to load; reads just enough of the file for `n` rows.
+pub fn read_head(path: &Path, opts: &LoadOptions, n: usize) -> Result<Table> {
+    use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+
+    let kind = detect_kind(path, opts.kind)
+        .ok_or_else(|| anyhow!("could not determine file type for {}", path.display()))?;
+    let (schema, batches) = match kind {
+        FileKind::Csv => read_csv(path, opts, Some(n))?,
+        FileKind::Parquet => {
+            let file = File::open(path)
+                .with_context(|| format!("failed to open {}", path.display()))?;
+            let builder = ParquetRecordBatchReaderBuilder::try_new(file)
+                .context("failed to open Parquet file")?;
+            let schema = builder.schema().clone();
+            let reader = builder
+                .with_limit(n)
+                .with_batch_size(n.clamp(1, 8192))
+                .build()
+                .context("failed to build Parquet reader")?;
+            let batches = reader
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .context("failed to read Parquet data")?;
+            (schema, batches)
+        }
+    };
+    Table::from_batches(path, kind, schema, batches)
 }
 
 fn load_parquet(path: &Path) -> Result<(SchemaRef, Vec<RecordBatch>)> {
@@ -454,6 +592,65 @@ mod tests {
         }
         assert_eq!(parquet_shape(&path).unwrap(), (7, 2));
         assert_eq!(detect_kind(&path, None), Some(FileKind::Parquet));
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn inspect_decides_when_to_stream() {
+        let path = temp_path("inspect.csv");
+        std::fs::write(&path, "a,b\n1,2\n3,4\n").unwrap();
+
+        let roomy = StreamLimits::default();
+        let info = inspect(&path, None, &roomy).unwrap();
+        assert_eq!(info.kind, FileKind::Csv);
+        assert!(!info.stream);
+
+        // Any CSV bigger than the limit is streamed instead of loaded.
+        let tight = StreamLimits {
+            max_csv_bytes: 4,
+            ..Default::default()
+        };
+        assert!(inspect(&path, None, &tight).unwrap().stream);
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn read_head_returns_first_rows_in_order() {
+        use arrow::array::Int64Array;
+        use arrow::datatypes::{Field, Schema};
+        use parquet::arrow::ArrowWriter;
+        use parquet::file::properties::WriterProperties;
+
+        // Several row groups, so "first rows" really means the file's start.
+        let path = temp_path("head.parquet");
+        let schema = Arc::new(Schema::new(vec![Field::new("n", DataType::Int64, false)]));
+        let props = WriterProperties::builder().set_max_row_group_row_count(Some(100)).build();
+        {
+            let file = File::create(&path).unwrap();
+            let mut w = ArrowWriter::try_new(file, schema.clone(), Some(props)).unwrap();
+            let batch = RecordBatch::try_new(
+                schema.clone(),
+                vec![Arc::new(Int64Array::from((0..1000).collect::<Vec<i64>>()))],
+            )
+            .unwrap();
+            w.write(&batch).unwrap();
+            w.close().unwrap();
+        }
+        let head = read_head(&path, &LoadOptions::default(), 250).unwrap();
+        assert_eq!(head.num_rows(), 250);
+        assert_eq!(head.cell(0, 0), "0");
+        assert_eq!(head.cell(249, 0), "249");
+        std::fs::remove_file(&path).ok();
+
+        let path = temp_path("head.csv");
+        let mut text = String::from("a,b\n");
+        for i in 0..100 {
+            text.push_str(&format!("{i},x{i}\n"));
+        }
+        std::fs::write(&path, text).unwrap();
+        let head = read_head(&path, &LoadOptions::default(), 10).unwrap();
+        assert_eq!(head.num_rows(), 10);
+        assert_eq!(head.cell(9, 1), "x9");
         std::fs::remove_file(&path).ok();
     }
 

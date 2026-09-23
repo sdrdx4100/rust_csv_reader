@@ -1,21 +1,32 @@
-//! Optional SQL querying powered by [DataFusion].
+//! SQL querying powered by [DataFusion].
 //!
 //! DataFusion reads the source file itself (CSV or Parquet) and exposes it as a
 //! table named `data`, so users can write queries like
-//! `SELECT * FROM data WHERE amount > 100 ORDER BY amount DESC`. Results are
-//! eagerly stringified into a plain grid, which keeps DataFusion's own (older)
-//! Arrow version entirely contained in this module — the rest of the app keeps
-//! using its own Arrow build.
+//! `SELECT * FROM data WHERE amount > 100 ORDER BY amount DESC`. The file is
+//! never loaded whole: each query streams through it. Results come back as a
+//! typed [`Table`] (handed across DataFusion's own Arrow version via the Arrow
+//! IPC format), as display strings for the GUI, as pretty text, or streamed as
+//! CSV.
 //!
 //! [DataFusion]: https://datafusion.apache.org/
 
-use std::path::Path;
+use std::io::Write;
+use std::path::{Path, PathBuf};
 
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, Context, Result};
 use datafusion::arrow::util::display::{ArrayFormatter, FormatOptions};
 use datafusion::prelude::{CsvReadOptions, ParquetReadOptions, SessionContext};
+use futures::StreamExt;
 
-use crate::data::FileKind;
+use crate::data::{FileKind, Table};
+
+/// A query result converted into the app's own [`Table`], so it can be shown,
+/// sorted, filtered and exported like any loaded file.
+pub struct SqlTable {
+    pub table: Table,
+    /// True when more rows matched than `max_rows` and the rest were dropped.
+    pub truncated: bool,
+}
 
 /// A fully-materialised, display-ready query result.
 pub struct SqlResult {
@@ -29,6 +40,8 @@ pub struct SqlResult {
 pub struct SqlEngine {
     rt: tokio::runtime::Runtime,
     ctx: SessionContext,
+    path: PathBuf,
+    kind: FileKind,
 }
 
 impl SqlEngine {
@@ -58,7 +71,101 @@ impl SqlEngine {
                 }
             }
         })?;
-        Ok(SqlEngine { rt, ctx })
+        Ok(SqlEngine {
+            rt,
+            ctx,
+            path: path.to_path_buf(),
+            kind,
+        })
+    }
+
+    /// Run `sql` and return at most `max_rows` rows as a typed [`Table`].
+    ///
+    /// DataFusion uses its own Arrow version, so the batches are handed over
+    /// through the (version-stable) Arrow IPC stream format rather than
+    /// stringified — column types, numeric alignment and sorting all survive.
+    pub fn query_table(&self, sql: &str, max_rows: usize) -> Result<SqlTable> {
+        use datafusion::arrow::ipc::writer::StreamWriter;
+
+        let (schema, batches) = self.rt.block_on(async {
+            let df = self.ctx.sql(sql).await?;
+            let schema = std::sync::Arc::new(df.schema().as_arrow().clone());
+            // One extra row tells us whether the result was capped.
+            let batches = df.limit(0, Some(max_rows + 1))?.collect().await?;
+            Ok::<_, anyhow::Error>((schema, batches))
+        })?;
+
+        let mut buf = Vec::new();
+        {
+            let mut w = StreamWriter::try_new(&mut buf, &schema)?;
+            for b in &batches {
+                w.write(b)?;
+            }
+            w.finish()?;
+        }
+        let reader = arrow::ipc::reader::StreamReader::try_new(std::io::Cursor::new(buf), None)
+            .context("failed to decode query result")?;
+        let schema = reader.schema();
+
+        let mut out = Vec::new();
+        let mut kept = 0usize;
+        let mut truncated = false;
+        for b in reader {
+            let b = b?;
+            if kept + b.num_rows() > max_rows {
+                out.push(b.slice(0, max_rows - kept));
+                truncated = true;
+                break;
+            }
+            kept += b.num_rows();
+            out.push(b);
+        }
+        Ok(SqlTable {
+            table: Table::from_batches(&self.path, self.kind, schema, out)?,
+            truncated,
+        })
+    }
+
+    /// Run `sql` and render up to `max_rows` rows as a boxed text table.
+    /// Returns the rendered text and whether rows were left out.
+    pub fn pretty(&self, sql: &str, max_rows: usize) -> Result<(String, bool)> {
+        self.rt.block_on(async {
+            let df = self.ctx.sql(sql).await?;
+            let batches = df.limit(0, Some(max_rows + 1))?.collect().await?;
+            let total: usize = batches.iter().map(|b| b.num_rows()).sum();
+            let mut kept = Vec::new();
+            let mut n = 0;
+            for b in batches {
+                let take = b.num_rows().min(max_rows - n);
+                if take == 0 {
+                    break;
+                }
+                kept.push(b.slice(0, take));
+                n += take;
+            }
+            let text = datafusion::arrow::util::pretty::pretty_format_batches(&kept)?.to_string();
+            Ok((text, total > max_rows))
+        })
+    }
+
+    /// Run `sql` and stream every result row to `out` as CSV (with a header),
+    /// batch by batch, so arbitrarily large results never sit in memory.
+    /// Returns the number of rows written.
+    pub fn write_csv(&self, sql: &str, out: impl Write) -> Result<usize> {
+        self.rt.block_on(async {
+            let df = self.ctx.sql(sql).await?;
+            let mut stream = df.execute_stream().await?;
+            let mut w = datafusion::arrow::csv::WriterBuilder::new()
+                .with_header(true)
+                .build(out);
+            let mut rows = 0;
+            while let Some(batch) = stream.next().await {
+                let batch = batch?;
+                rows += batch.num_rows();
+                w.write(&batch)?;
+            }
+            Ok(rows)
+        })
     }
 
     /// Run `sql`, returning at most `max_rows` rows for display.
@@ -152,6 +259,47 @@ mod tests {
         let res = engine.query("SELECT * FROM data", 5).unwrap();
         assert_eq!(res.rows.len(), 5);
         assert!(res.truncated);
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn query_table_keeps_types_and_caps_rows() {
+        let path = sample_csv();
+        let engine = SqlEngine::new(&path, FileKind::Csv, b',', true).unwrap();
+
+        let res = engine
+            .query_table("SELECT id, name FROM data ORDER BY id DESC", 5)
+            .unwrap();
+        assert!(res.truncated);
+        assert_eq!(res.table.num_rows(), 5);
+        assert_eq!(res.table.column_names(), &["id", "name"]);
+        // The integer column arrives as a real integer, not text.
+        assert_eq!(res.table.column_types()[0], "int");
+        assert_eq!(res.table.cell(0, 0), "19");
+
+        let all = engine.query_table("SELECT COUNT(*) AS n FROM data", 5).unwrap();
+        assert!(!all.truncated);
+        assert_eq!(all.table.cell(0, 0), "20");
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn pretty_and_csv_output() {
+        let path = sample_csv();
+        let engine = SqlEngine::new(&path, FileKind::Csv, b',', true).unwrap();
+
+        let (text, more) = engine.pretty("SELECT id FROM data ORDER BY id", 3).unwrap();
+        assert!(more);
+        assert!(text.contains("| id |"), "{text}");
+        assert!(text.contains("| 2  |"), "{text}");
+        assert!(!text.contains("| 3  |"), "{text}");
+
+        let mut buf = Vec::new();
+        let n = engine
+            .write_csv("SELECT id, score FROM data WHERE id < 3 ORDER BY id", &mut buf)
+            .unwrap();
+        assert_eq!(n, 3);
+        assert_eq!(String::from_utf8(buf).unwrap(), "id,score\n0,0\n1,10\n2,20\n");
         std::fs::remove_file(&path).ok();
     }
 

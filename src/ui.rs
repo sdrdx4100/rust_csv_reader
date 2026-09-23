@@ -8,7 +8,8 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
 use ratatui::Frame;
 
-use crate::app::{App, ColStats, Mode, SortDir};
+use crate::app::{group_digits, sql_ident, App, ColStats, Mode, SortDir, PREVIEW_ROWS, SQL_ROW_CAP};
+use crate::sql::SqlEngine;
 use crate::data::is_numeric_type;
 
 // A restrained 256-colour palette; degrades gracefully on most terminals.
@@ -28,22 +29,32 @@ const C_DIM: Color = Color::Indexed(245);
 pub fn render(f: &mut Frame, app: &mut App) {
     let area = f.area();
 
-    // The file browser (and any state without a loaded table) takes the screen.
-    if app.mode == Mode::Browser || app.table.is_none() {
+    // The file browser (and the state with no file open) takes the screen.
+    if app.mode == Mode::Browser || app.source.is_none() {
         render_browser(f, app, area);
         return;
     }
 
+    // The SQL prompt opens as a 4-line panel above the status bar.
+    let sql_h = if app.mode == Mode::Sql { 4 } else { 0 };
     let chunks = Layout::vertical([
         Constraint::Length(1),
         Constraint::Min(1),
+        Constraint::Length(sql_h),
         Constraint::Length(1),
     ])
     .split(area);
 
     render_title(f, app, chunks[0]);
-    render_grid(f, app, chunks[1]);
-    render_status(f, app, chunks[2]);
+    if app.table.is_some() {
+        render_grid(f, app, chunks[1]);
+    } else {
+        render_placeholder(f, app, chunks[1]);
+    }
+    if app.mode == Mode::Sql {
+        render_sql_panel(f, app, chunks[2]);
+    }
+    render_status(f, app, chunks[3]);
 
     match app.mode {
         Mode::Help => render_help(f, area),
@@ -54,23 +65,112 @@ pub fn render(f: &mut Frame, app: &mut App) {
 }
 
 fn render_title(f: &mut Frame, app: &App, area: Rect) {
-    let Some(table) = app.table.as_ref() else {
+    let Some(src) = app.source.as_ref() else {
         return;
     };
-    let name = table.path.file_name().and_then(|s| s.to_str()).unwrap_or("?");
-    let line = Line::from(vec![
+    let name = src.path.file_name().and_then(|s| s.to_str()).unwrap_or("?");
+    let rows = src.rows.map_or("?".to_string(), group_digits);
+    let cols = src.cols.map_or("?".to_string(), |c| c.to_string());
+    let mut spans = vec![
         Span::styled(" Tessera ", Style::default().fg(Color::Black).bg(C_ACCENT).add_modifier(Modifier::BOLD)),
         Span::raw(" "),
         Span::styled(name, Style::default().add_modifier(Modifier::BOLD)),
         Span::raw("  "),
-        Span::styled(format!("[{}]", table.kind.label()), Style::default().fg(C_ACCENT)),
+        Span::styled(format!("[{}]", src.kind.label()), Style::default().fg(C_ACCENT)),
         Span::raw("  "),
-        Span::styled(
-            format!("{} rows × {} cols", table.num_rows(), table.num_cols()),
-            Style::default().fg(C_DIM),
-        ),
+        Span::styled(format!("{rows} rows × {cols} cols"), Style::default().fg(C_DIM)),
+    ];
+    if src.streamed {
+        spans.push(Span::styled("  not loaded (SQL mode)", Style::default().fg(C_GUTTER_SEL)));
+    }
+    // What the grid is showing: the file, its preview, or an SQL result.
+    if let (Some(_), Some(t)) = (&app.sql.shown, &app.table) {
+        let mut info = format!("  │ result {} rows", group_digits(t.num_rows()));
+        if app.sql.truncated {
+            info.push_str(&format!(" (first {})", group_digits(SQL_ROW_CAP)));
+        }
+        if let Some(d) = app.sql.elapsed {
+            info.push_str(&format!(" · {:.2}s", d.as_secs_f32()));
+        }
+        spans.push(Span::styled(info, Style::default().fg(C_ACCENT).add_modifier(Modifier::BOLD)));
+    } else if app.showing_preview() {
+        spans.push(Span::styled(
+            format!("  │ preview: first {} rows", group_digits(PREVIEW_ROWS)),
+            Style::default().fg(C_ACCENT),
+        ));
+    }
+    if let Some(t) = app.sql.started {
+        spans.push(Span::styled(
+            format!("  ⏳ running query… {:.1}s", t.elapsed().as_secs_f32()),
+            Style::default().fg(Color::Yellow),
+        ));
+    }
+    f.render_widget(Paragraph::new(Line::from(spans)), area);
+}
+
+/// Shown in place of the grid while a streamed file has no result yet.
+fn render_placeholder(f: &mut Frame, app: &App, area: Rect) {
+    let msg = if app.sql_running() {
+        "  ⏳ running the query… (the file is read on demand, nothing is loaded)".to_string()
+    } else if let Some(err) = &app.sql.error {
+        format!("  {}  — press S to query the file with SQL.", one_line(err))
+    } else {
+        "  Press S to query the file with SQL.".to_string()
+    };
+    f.render_widget(Paragraph::new(Line::from(Span::styled(msg, Style::default().fg(C_DIM)))), area);
+}
+
+/// The SQL prompt: the query being edited, plus a line of hints, completion
+/// candidates or the last error.
+fn render_sql_panel(f: &mut Frame, app: &App, area: Rect) {
+    let block = Block::default()
+        .title(format!(" SQL — this file is the table `{}` ", SqlEngine::TABLE))
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(C_ACCENT));
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    // Query line with a block cursor, scrolled so the cursor stays visible.
+    let chars: Vec<char> = app.sql.input.chars().collect();
+    let cur = app.sql.cursor.min(chars.len());
+    let width = inner.width.saturating_sub(3) as usize; // "> " + cursor cell
+    let start = cur.saturating_sub(width.saturating_sub(1));
+    let end = (start + width).min(chars.len());
+    let before: String = chars[start..cur].iter().collect();
+    let at: String = chars.get(cur).map_or(" ".to_string(), |c| c.to_string());
+    let after: String = if cur < end { chars[cur + 1..end].iter().collect() } else { String::new() };
+    let query_line = Line::from(vec![
+        Span::styled("> ", Style::default().fg(C_ACCENT).add_modifier(Modifier::BOLD)),
+        Span::styled(before, Style::default().add_modifier(Modifier::BOLD)),
+        Span::styled(at, Style::default().bg(C_ACCENT).fg(Color::Black)),
+        Span::styled(after, Style::default().add_modifier(Modifier::BOLD)),
     ]);
-    f.render_widget(Paragraph::new(line), area);
+
+    let info_line = if let Some(err) = &app.sql.error {
+        Line::from(Span::styled(format!("error: {}", one_line(err)), Style::default().fg(Color::Red)))
+    } else if !app.sql.suggestions.is_empty() {
+        Line::from(vec![
+            Span::styled("Tab: ", Style::default().fg(C_DIM)),
+            Span::styled(app.sql.suggestions.join("  "), Style::default().fg(C_GUTTER_SEL)),
+        ])
+    } else {
+        let cols = app.sql_columns();
+        let cols = if cols.is_empty() {
+            "(Tab to list columns)".to_string()
+        } else {
+            cols.iter().map(|c| sql_ident(c)).collect::<Vec<_>>().join(", ")
+        };
+        Line::from(vec![
+            Span::styled("Enter run · Esc close · Tab complete · ↑↓ history · Ctrl-u clear   ", Style::default().fg(C_DIM)),
+            Span::styled(format!("columns: {cols}"), Style::default().fg(C_GUTTER_FG)),
+        ])
+    };
+    f.render_widget(Paragraph::new(vec![query_line, info_line]), inner);
+}
+
+/// Collapse a (possibly multi-line) error message onto one line.
+fn one_line(s: &str) -> String {
+    s.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 fn render_grid(f: &mut Frame, app: &mut App, area: Rect) {
@@ -264,8 +364,12 @@ fn render_status(f: &mut Frame, app: &App, area: Rect) {
             if let Some(msg) = &app.status {
                 spans.push(Span::styled(format!("  {msg}"), Style::default().fg(Color::Yellow)));
             }
+            if app.can_go_back() {
+                let to = if app.source.as_ref().is_some_and(|s| s.streamed) { "preview" } else { "file" };
+                spans.push(Span::styled(format!("   Esc back to {to}"), Style::default().fg(C_ACCENT)));
+            }
             spans.push(Span::styled(
-                "   /find  s sort  o open  y copy  e export  ? help",
+                "   S sql  /find  s sort  o open  y copy  e export  ? help",
                 Style::default().fg(C_DIM),
             ));
             Line::from(spans)
@@ -367,6 +471,13 @@ fn render_help(f: &mut Frame, area: Rect) {
         kv("n", "clear active filter"),
         kv(":", "go to row number"),
         Line::raw(""),
+        section("SQL (the file is table `data`)"),
+        kv("S / F5", "open the SQL prompt — Enter runs it"),
+        kv("Tab  ↑↓", "complete names · query history"),
+        kv("Esc", "back from a result to the file"),
+        kv("e.g.", "SELECT * FROM data WHERE name LIKE '%foo%'"),
+        kv("", "SELECT city, COUNT(*) FROM data GROUP BY city"),
+        Line::raw(""),
         section("Files & data"),
         kv("o", "open another file (browser)"),
         kv("y / Y", "copy cell / row to clipboard"),
@@ -374,11 +485,11 @@ fn render_help(f: &mut Frame, area: Rect) {
         Line::raw(""),
         section("Other"),
         kv("? ", "toggle this help"),
-        kv("q / Esc / Ctrl-c", "quit"),
+        kv("q / Ctrl-c", "quit (Esc too, outside a result)"),
         Line::raw(""),
         Line::from(Span::styled("  press any key to close ", Style::default().fg(C_DIM))),
     ];
-    let popup = centered_rect(62, 92, area);
+    let popup = centered_rect(70, 96, area);
     f.render_widget(Clear, popup);
     let block = Block::default()
         .title(" Help ")
@@ -607,9 +718,193 @@ mod tests {
     use super::*;
     use crate::data::{LoadOptions, Table};
     use ratatui::backend::TestBackend;
-    use ratatui::crossterm::event::{KeyCode, KeyEvent};
+    use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use ratatui::Terminal;
     use std::io::Write;
+
+    /// A 50-row CSV on disk (kept, since SQL reads the file itself) and an app
+    /// with it opened. The caller deletes the file.
+    fn file_app(stream: bool) -> (App, std::path::PathBuf) {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static SEQ: AtomicU32 = AtomicU32::new(0);
+        let mut p = std::env::temp_dir();
+        p.push(format!(
+            "tessera_sqlui_{}_{}.csv",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        let mut f = std::fs::File::create(&p).unwrap();
+        writeln!(f, "id,name,score").unwrap();
+        for i in 0..50 {
+            writeln!(f, "{i},name{i},{}", i * 10).unwrap();
+        }
+        f.flush().unwrap();
+
+        let mut app = App::browser_only(LoadOptions::default(), std::env::temp_dir());
+        if stream {
+            app.limits.max_csv_bytes = 1; // anything counts as "too big"
+        }
+        app.open_path(p.clone());
+        (app, p)
+    }
+
+    fn key(app: &mut App, code: KeyCode) {
+        app.on_key(KeyEvent::from(code));
+    }
+
+    fn ctrl(app: &mut App, c: char) {
+        app.on_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL));
+    }
+
+    fn type_str(app: &mut App, text: &str) {
+        for c in text.chars() {
+            key(app, KeyCode::Char(c));
+        }
+    }
+
+    /// Wait for the background query to finish, redrawing like the real loop.
+    fn wait_sql(app: &mut App) {
+        for _ in 0..500 {
+            draw(app);
+            if !app.tick() {
+                draw(app);
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        panic!("query did not finish");
+    }
+
+    /// Replace the prompt's text with `sql` and run it.
+    fn run_query(app: &mut App, sql: &str) {
+        key(app, KeyCode::Char('S'));
+        assert_eq!(app.mode, Mode::Sql);
+        draw(app);
+        ctrl(app, 'u');
+        type_str(app, sql);
+        key(app, KeyCode::Enter);
+        wait_sql(app);
+    }
+
+    #[test]
+    fn big_file_opens_in_sql_mode_without_loading() {
+        let (mut app, path) = file_app(true);
+        let src = app.source.clone().expect("source");
+        assert!(src.streamed);
+        assert_eq!(app.mode, Mode::Normal);
+        // Only a preview of the first rows was read; no query is running.
+        assert!(app.showing_preview());
+        assert!(!app.sql_running());
+        assert_eq!(app.num_rows(), 50);
+        draw(&mut app);
+
+        // Searching the whole file is an SQL query.
+        run_query(&mut app, "SELECT id, name FROM data WHERE score >= 450 ORDER BY id");
+        assert!(app.sql.error.is_none(), "{:?}", app.sql.error);
+        assert_eq!(app.num_rows(), 5);
+        assert_eq!(app.table.as_ref().unwrap().cell(0, 0), "45");
+
+        // Esc goes back from the result to the preview (and doesn't quit).
+        assert!(app.can_go_back());
+        key(&mut app, KeyCode::Esc);
+        assert!(!app.should_quit);
+        assert!(app.showing_preview());
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn sql_result_on_loaded_file_and_back() {
+        let (mut app, path) = file_app(false);
+        assert!(!app.source.as_ref().unwrap().streamed);
+        assert_eq!(app.num_rows(), 50);
+
+        // The prompt starts from a helpful template.
+        key(&mut app, KeyCode::Char('S'));
+        assert_eq!(app.sql.input, "SELECT * FROM data WHERE ");
+        type_str(&mut app, "id < 3");
+        key(&mut app, KeyCode::Enter);
+        wait_sql(&mut app);
+        assert_eq!(app.num_rows(), 3);
+        assert!(app.can_go_back());
+
+        // Results behave like any table: e.g. sort them.
+        key(&mut app, KeyCode::Char('s'));
+        draw(&mut app);
+
+        key(&mut app, KeyCode::Esc);
+        assert!(!app.should_quit);
+        assert_eq!(app.num_rows(), 50);
+        assert!(!app.can_go_back());
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn sql_error_reopens_the_prompt() {
+        let (mut app, path) = file_app(false);
+        run_query(&mut app, "SELECT nope FROM data");
+        assert!(app.sql.error.is_some());
+        assert_eq!(app.mode, Mode::Sql);
+        // The table on screen is untouched.
+        assert_eq!(app.num_rows(), 50);
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn tab_completes_columns_table_and_keywords() {
+        let (mut app, path) = file_app(false);
+        key(&mut app, KeyCode::Char('S'));
+        ctrl(&mut app, 'u');
+        type_str(&mut app, "SELECT na");
+        key(&mut app, KeyCode::Tab);
+        assert_eq!(app.sql.input, "SELECT name ");
+        type_str(&mut app, "FROM da");
+        key(&mut app, KeyCode::Tab);
+        assert_eq!(app.sql.input, "SELECT name FROM data ");
+        type_str(&mut app, "wh");
+        key(&mut app, KeyCode::Tab);
+        assert_eq!(app.sql.input, "SELECT name FROM data WHERE ");
+
+        // Several matches are listed instead of guessed.
+        type_str(&mut app, "s");
+        key(&mut app, KeyCode::Tab);
+        assert!(app.sql.suggestions.contains(&"score".to_string()));
+        assert!(app.sql.suggestions.contains(&"SELECT".to_string()));
+        draw(&mut app);
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn prompt_editing_and_history() {
+        let (mut app, path) = file_app(false);
+        run_query(&mut app, "SELECT COUNT(*) FROM data");
+        assert_eq!(app.table.as_ref().unwrap().cell(0, 0), "50");
+
+        key(&mut app, KeyCode::Char('S'));
+        ctrl(&mut app, 'u');
+        assert_eq!(app.sql.input, "");
+        key(&mut app, KeyCode::Up);
+        assert_eq!(app.sql.input, "SELECT COUNT(*) FROM data");
+
+        // Cursor editing in the middle of the line.
+        key(&mut app, KeyCode::Home);
+        key(&mut app, KeyCode::Delete);
+        type_str(&mut app, "s");
+        assert_eq!(app.sql.input, "sELECT COUNT(*) FROM data");
+        key(&mut app, KeyCode::Esc);
+        assert_eq!(app.mode, Mode::Normal);
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn unreadable_file_shows_error_instead_of_exiting() {
+        let mut p = std::env::temp_dir();
+        p.push(format!("tessera_missing_{}.parquet", std::process::id()));
+        let mut app = App::browser_only(LoadOptions::default(), std::env::temp_dir());
+        app.open_path(p);
+        assert_eq!(app.mode, Mode::Browser);
+        assert!(app.browser.error.is_some());
+        draw(&mut app);
+    }
 
     fn sample_app() -> App {
         use std::sync::atomic::{AtomicU32, Ordering};

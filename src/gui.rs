@@ -14,22 +14,22 @@ use std::time::{Duration, Instant};
 use eframe::egui;
 use egui_extras::{Column, TableBuilder};
 
-use crate::data::{detect_kind, is_numeric_type, parquet_shape, FileKind, LoadOptions, Table};
+use crate::app::{group_digits, PREVIEW_ROWS};
+use crate::data::{inspect, is_numeric_type, read_head, FileKind, LoadOptions, StreamLimits, Table};
 use crate::sql::{SqlEngine, SqlResult};
 
 /// Most rows a SQL result will display (keeps memory and build time bounded).
 const SQL_ROW_CAP: usize = 100_000;
 
-/// Parquet files with more rows than this are never loaded into memory whole.
-/// They open in SQL-only mode: only the footer is read up front, and DataFusion
-/// streams through the file for each query.
-const LAZY_ROW_THRESHOLD: usize = 2_000_000;
-
-/// A large Parquet file opened in SQL-only mode (see [`LAZY_ROW_THRESHOLD`]).
+/// A file too large to load (see [`StreamLimits`]), opened in SQL-only mode:
+/// nothing is read up front beyond metadata, and DataFusion streams through
+/// the file for each query.
 struct LazyFile {
     path: PathBuf,
-    rows: usize,
-    cols: usize,
+    kind: FileKind,
+    /// Known for Parquet (from the footer); `None` for a big CSV.
+    rows: Option<usize>,
+    cols: Option<usize>,
 }
 
 /// CSV field delimiter choices offered in the toolbar.
@@ -90,7 +90,7 @@ struct TesseraGui {
     table: Option<Table>,
     /// Set instead of `table` when a large Parquet file is open in SQL-only mode.
     lazy: Option<LazyFile>,
-    lazy_threshold: usize,
+    limits: StreamLimits,
     error: Option<String>,
     path_input: String,
 
@@ -124,7 +124,7 @@ impl TesseraGui {
         let mut app = TesseraGui {
             table: None,
             lazy: None,
-            lazy_threshold: LAZY_ROW_THRESHOLD,
+            limits: StreamLimits::default(),
             error: None,
             path_input: String::new(),
             delimiter: Delimiter::Comma,
@@ -149,19 +149,17 @@ impl TesseraGui {
     }
 
     fn open(&mut self, path: &Path) {
-        // Huge Parquet files are not loaded whole: read just the footer and hand
-        // the file to DataFusion, which streams through it per query.
-        if detect_kind(path, None) == Some(FileKind::Parquet) {
-            match parquet_shape(path) {
-                Ok((rows, cols)) if rows > self.lazy_threshold => {
-                    self.open_lazy(path, rows, cols);
-                    return;
-                }
-                Ok(_) => {}
-                Err(e) => {
-                    self.error = Some(format!("{e:#}"));
-                    return;
-                }
+        // Files too big to load are not read at all: only their metadata is
+        // looked at, and DataFusion streams through them per query.
+        match inspect(path, None, &self.limits) {
+            Ok(info) if info.stream => {
+                self.open_lazy(path, info.kind, info.rows, info.cols);
+                return;
+            }
+            Ok(_) => {}
+            Err(e) => {
+                self.error = Some(crate::error_text(&e));
+                return;
             }
         }
 
@@ -184,13 +182,13 @@ impl TesseraGui {
                 self.reset_sql();
             }
             Err(e) => {
-                self.error = Some(format!("{e:#}"));
+                self.error = Some(crate::error_text(&e));
             }
         }
     }
 
-    /// Open a large Parquet file in SQL-only mode and show a preview.
-    fn open_lazy(&mut self, path: &Path, rows: usize, cols: usize) {
+    /// Open a file too big to load in SQL-only mode, showing its first rows.
+    fn open_lazy(&mut self, path: &Path, kind: FileKind, rows: Option<usize>, cols: Option<usize>) {
         self.table = None;
         self.filtered.clear();
         self.haystack = None;
@@ -200,13 +198,43 @@ impl TesseraGui {
         self.path_input = path.display().to_string();
         self.lazy = Some(LazyFile {
             path: path.to_path_buf(),
+            kind,
             rows,
             cols,
         });
         self.reset_sql();
         self.sql_mode = true;
-        self.sql_input = format!("SELECT * FROM {} LIMIT 1000", SqlEngine::TABLE);
-        self.run_sql();
+        self.sql_input = format!("SELECT * FROM {} WHERE ", SqlEngine::TABLE);
+        // Preview: the file's first rows, read directly (in file order).
+        let opts = LoadOptions {
+            delimiter: self.delimiter.byte(),
+            has_header: self.has_header,
+            ..Default::default()
+        };
+        match read_head(path, &opts, PREVIEW_ROWS) {
+            Ok(head) => {
+                let fmts = head.formatters().ok();
+                let rows = (0..head.num_rows())
+                    .map(|r| {
+                        (0..head.num_cols())
+                            .map(|c| match &fmts {
+                                Some(f) => f[c].value(r).to_string(),
+                                None => head.cell(r, c),
+                            })
+                            .collect()
+                    })
+                    .collect();
+                if let Some(l) = &mut self.lazy {
+                    l.cols = l.cols.or(Some(head.num_cols()));
+                }
+                self.sql_result = Some(SqlResult {
+                    columns: head.column_names().to_vec(),
+                    rows,
+                    truncated: false,
+                });
+            }
+            Err(e) => self.sql_error = Some(crate::error_text(&e)),
+        }
     }
 
     fn reset_sql(&mut self) {
@@ -221,7 +249,7 @@ impl TesseraGui {
     /// Path and kind of whatever is open, loaded or lazy.
     fn current_source(&self) -> Option<(PathBuf, FileKind)> {
         if let Some(l) = &self.lazy {
-            return Some((l.path.clone(), FileKind::Parquet));
+            return Some((l.path.clone(), l.kind));
         }
         self.table.as_ref().map(|t| (t.path.clone(), t.kind))
     }
@@ -249,7 +277,7 @@ impl TesseraGui {
             match SqlEngine::new(&path, kind, self.delimiter.byte(), self.has_header) {
                 Ok(engine) => self.sql_engine = Some(Arc::new(engine)),
                 Err(e) => {
-                    self.sql_error = Some(format!("{e:#}"));
+                    self.sql_error = Some(crate::error_text(&e));
                     self.sql_result = None;
                     return;
                 }
@@ -264,7 +292,7 @@ impl TesseraGui {
         std::thread::spawn(move || {
             let res = engine
                 .query(&sql, SQL_ROW_CAP)
-                .map_err(|e| format!("{e:#}"));
+                .map_err(|e| crate::error_text(&e));
             let _ = tx.send(res);
         });
         self.sql_pending = Some(rx);
@@ -342,19 +370,6 @@ impl TesseraGui {
         let hay = self.haystack.as_ref().expect("haystack built");
         self.filtered = (0..rows).filter(|&r| hay[r].contains(&needle)).collect();
     }
-}
-
-/// Format a count with thousands separators, e.g. 10000000 → "10,000,000".
-fn group_digits(n: usize) -> String {
-    let s = n.to_string();
-    let mut out = String::with_capacity(s.len() + s.len() / 3);
-    for (i, ch) in s.chars().enumerate() {
-        if i > 0 && (s.len() - i) % 3 == 0 {
-            out.push(',');
-        }
-        out.push(ch);
-    }
-    out
 }
 
 /// Render one data cell: numeric values are right-aligned, the full value
@@ -491,9 +506,10 @@ impl eframe::App for TesseraGui {
                 } else if let Some(l) = &self.lazy {
                     let name = l.path.file_name().and_then(|s| s.to_str()).unwrap_or("?");
                     ui.weak(format!(
-                        "{name}  ·  [Parquet]  ·  {} cols  ·  {} rows  ·  large file: not loaded, browse with SQL",
-                        l.cols,
-                        group_digits(l.rows),
+                        "{name}  ·  [{}]  ·  {} cols  ·  {} rows  ·  large file: not loaded, browse with SQL",
+                        l.kind.label(),
+                        l.cols.map_or("?".into(), |c| c.to_string()),
+                        l.rows.map_or("?".into(), group_digits),
                     ));
                 } else {
                     ui.weak("Drag a CSV or Parquet file onto the window, or type a path above.");
@@ -728,18 +744,20 @@ mod tests {
     fn large_parquet_opens_in_sql_mode_without_loading() {
         let path = sample_parquet(50);
         let mut app = TesseraGui::new(None);
-        app.lazy_threshold = 10; // treat 50 rows as "large"
+        app.limits.max_rows = 10; // treat 50 rows as "large"
         app.open(&path);
 
         // Nothing was materialised; only the footer's shape is known.
         assert!(app.table.is_none());
         let lazy = app.lazy.as_ref().expect("lazy mode");
-        assert_eq!((lazy.rows, lazy.cols), (50, 2));
+        assert_eq!((lazy.rows, lazy.cols), (Some(50), Some(2)));
         assert!(app.sql_mode);
 
-        // The preview query runs in the background and shows the rows.
-        wait_sql(&mut app);
-        assert_eq!(app.sql_result.as_ref().unwrap().rows.len(), 50);
+        // The preview (the file's first rows) is shown right away.
+        assert!(app.sql_pending.is_none());
+        let preview = app.sql_result.as_ref().unwrap();
+        assert_eq!(preview.rows.len(), 50);
+        assert_eq!(preview.rows[0][0], "0");
 
         // Searching is done with SQL over the whole file.
         app.sql_input = "SELECT id FROM data WHERE name LIKE 'name4%' ORDER BY id".into();
