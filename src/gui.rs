@@ -3,18 +3,34 @@
 //! It reuses the same Arrow-backed [`Table`] as the terminal UI and renders a
 //! *virtualised* table — only the rows currently on screen are built each
 //! frame — so opening a file with a million rows stays smooth. A single search
-//! box filters rows across every column.
+//! box filters rows across every column. Very large Parquet files are not
+//! loaded at all: they open in SQL-only mode backed by DataFusion.
 
 use std::path::{Path, PathBuf};
+use std::sync::mpsc::{self, Receiver, TryRecvError};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use eframe::egui;
 use egui_extras::{Column, TableBuilder};
 
-use crate::data::{is_numeric_type, LoadOptions, Table};
+use crate::data::{detect_kind, is_numeric_type, parquet_shape, FileKind, LoadOptions, Table};
 use crate::sql::{SqlEngine, SqlResult};
 
 /// Most rows a SQL result will display (keeps memory and build time bounded).
 const SQL_ROW_CAP: usize = 100_000;
+
+/// Parquet files with more rows than this are never loaded into memory whole.
+/// They open in SQL-only mode: only the footer is read up front, and DataFusion
+/// streams through the file for each query.
+const LAZY_ROW_THRESHOLD: usize = 2_000_000;
+
+/// A large Parquet file opened in SQL-only mode (see [`LAZY_ROW_THRESHOLD`]).
+struct LazyFile {
+    path: PathBuf,
+    rows: usize,
+    cols: usize,
+}
 
 /// CSV field delimiter choices offered in the toolbar.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -72,6 +88,9 @@ pub fn run(path: Option<PathBuf>) -> eframe::Result<()> {
 
 struct TesseraGui {
     table: Option<Table>,
+    /// Set instead of `table` when a large Parquet file is open in SQL-only mode.
+    lazy: Option<LazyFile>,
+    lazy_threshold: usize,
     error: Option<String>,
     path_input: String,
 
@@ -90,15 +109,22 @@ struct TesseraGui {
     sql_mode: bool,
     sql_input: String,
     /// DataFusion session (built lazily on first query), result, and any error.
-    sql_engine: Option<SqlEngine>,
+    sql_engine: Option<Arc<SqlEngine>>,
     sql_result: Option<SqlResult>,
     sql_error: Option<String>,
+    /// A query running on a background thread, and when it started.
+    sql_pending: Option<Receiver<Result<SqlResult, String>>>,
+    sql_started: Option<Instant>,
+    /// How long the last finished query took.
+    sql_elapsed: Option<Duration>,
 }
 
 impl TesseraGui {
     fn new(path: Option<PathBuf>) -> Self {
         let mut app = TesseraGui {
             table: None,
+            lazy: None,
+            lazy_threshold: LAZY_ROW_THRESHOLD,
             error: None,
             path_input: String::new(),
             delimiter: Delimiter::Comma,
@@ -112,6 +138,9 @@ impl TesseraGui {
             sql_engine: None,
             sql_result: None,
             sql_error: None,
+            sql_pending: None,
+            sql_started: None,
+            sql_elapsed: None,
         };
         if let Some(p) = path {
             app.open(&p);
@@ -120,6 +149,22 @@ impl TesseraGui {
     }
 
     fn open(&mut self, path: &Path) {
+        // Huge Parquet files are not loaded whole: read just the footer and hand
+        // the file to DataFusion, which streams through it per query.
+        if detect_kind(path, None) == Some(FileKind::Parquet) {
+            match parquet_shape(path) {
+                Ok((rows, cols)) if rows > self.lazy_threshold => {
+                    self.open_lazy(path, rows, cols);
+                    return;
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    self.error = Some(format!("{e:#}"));
+                    return;
+                }
+            }
+        }
+
         let opts = LoadOptions {
             delimiter: self.delimiter.byte(),
             has_header: self.has_header,
@@ -129,15 +174,14 @@ impl TesseraGui {
             Ok(table) => {
                 self.filtered = (0..table.num_rows()).collect();
                 self.table = Some(table);
+                self.lazy = None;
                 self.error = None;
                 self.haystack = None;
                 self.query.clear();
                 self.last_query.clear();
                 self.path_input = path.display().to_string();
                 // A new file means a fresh SQL session and cleared results.
-                self.sql_engine = None;
-                self.sql_result = None;
-                self.sql_error = None;
+                self.reset_sql();
             }
             Err(e) => {
                 self.error = Some(format!("{e:#}"));
@@ -145,16 +189,53 @@ impl TesseraGui {
         }
     }
 
+    /// Open a large Parquet file in SQL-only mode and show a preview.
+    fn open_lazy(&mut self, path: &Path, rows: usize, cols: usize) {
+        self.table = None;
+        self.filtered.clear();
+        self.haystack = None;
+        self.query.clear();
+        self.last_query.clear();
+        self.error = None;
+        self.path_input = path.display().to_string();
+        self.lazy = Some(LazyFile {
+            path: path.to_path_buf(),
+            rows,
+            cols,
+        });
+        self.reset_sql();
+        self.sql_mode = true;
+        self.sql_input = format!("SELECT * FROM {} LIMIT 1000", SqlEngine::TABLE);
+        self.run_sql();
+    }
+
+    fn reset_sql(&mut self) {
+        self.sql_engine = None;
+        self.sql_result = None;
+        self.sql_error = None;
+        self.sql_pending = None;
+        self.sql_started = None;
+        self.sql_elapsed = None;
+    }
+
+    /// Path and kind of whatever is open, loaded or lazy.
+    fn current_source(&self) -> Option<(PathBuf, FileKind)> {
+        if let Some(l) = &self.lazy {
+            return Some((l.path.clone(), FileKind::Parquet));
+        }
+        self.table.as_ref().map(|t| (t.path.clone(), t.kind))
+    }
+
     /// Re-open the current file — used when the CSV parse settings change.
     fn reopen(&mut self) {
-        if let Some(path) = self.table.as_ref().map(|t| t.path.clone()) {
+        if let Some((path, _)) = self.current_source() {
             self.open(&path);
         }
     }
 
     /// Execute the SQL box against the open file, building the engine on demand.
     fn run_sql(&mut self) {
-        let Some((path, kind)) = self.table.as_ref().map(|t| (t.path.clone(), t.kind)) else {
+        let Some((path, kind)) = self.current_source() else {
             self.sql_error = Some("open a file first".into());
             self.sql_result = None;
             return;
@@ -166,7 +247,7 @@ impl TesseraGui {
         }
         if self.sql_engine.is_none() {
             match SqlEngine::new(&path, kind, self.delimiter.byte(), self.has_header) {
-                Ok(engine) => self.sql_engine = Some(engine),
+                Ok(engine) => self.sql_engine = Some(Arc::new(engine)),
                 Err(e) => {
                     self.sql_error = Some(format!("{e:#}"));
                     self.sql_result = None;
@@ -174,17 +255,46 @@ impl TesseraGui {
                 }
             }
         }
-        let engine = self.sql_engine.as_ref().expect("engine built");
-        match engine.query(self.sql_input.trim(), SQL_ROW_CAP) {
+        // Run the query off the UI thread: a full scan of a big file can take a
+        // while, and the window should stay responsive meanwhile. Starting a new
+        // query simply drops the old receiver, so a stale result is discarded.
+        let engine = Arc::clone(self.sql_engine.as_ref().expect("engine built"));
+        let sql = self.sql_input.trim().to_string();
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let res = engine
+                .query(&sql, SQL_ROW_CAP)
+                .map_err(|e| format!("{e:#}"));
+            let _ = tx.send(res);
+        });
+        self.sql_pending = Some(rx);
+        self.sql_started = Some(Instant::now());
+        self.sql_error = None;
+    }
+
+    /// Pick up a finished background query. Returns true while one is running.
+    fn poll_sql(&mut self) -> bool {
+        let Some(rx) = &self.sql_pending else {
+            return false;
+        };
+        let outcome = match rx.try_recv() {
+            Ok(res) => res,
+            Err(TryRecvError::Empty) => return true,
+            Err(TryRecvError::Disconnected) => Err("query stopped unexpectedly".to_string()),
+        };
+        self.sql_pending = None;
+        self.sql_elapsed = self.sql_started.take().map(|t| t.elapsed());
+        match outcome {
             Ok(res) => {
                 self.sql_result = Some(res);
                 self.sql_error = None;
             }
             Err(e) => {
-                self.sql_error = Some(format!("{e:#}"));
                 self.sql_result = None;
+                self.sql_error = Some(e);
             }
         }
+        false
     }
 
     /// Build (once) the lowercased haystack used for substring search.
@@ -234,6 +344,19 @@ impl TesseraGui {
     }
 }
 
+/// Format a count with thousands separators, e.g. 10000000 → "10,000,000".
+fn group_digits(n: usize) -> String {
+    let s = n.to_string();
+    let mut out = String::with_capacity(s.len() + s.len() / 3);
+    for (i, ch) in s.chars().enumerate() {
+        if i > 0 && (s.len() - i) % 3 == 0 {
+            out.push(',');
+        }
+        out.push(ch);
+    }
+    out
+}
+
 /// Render one data cell: numeric values are right-aligned, the full value
 /// shows on hover (so clipped cells stay readable), and a click copies it.
 fn cell_ui(ui: &mut egui::Ui, text: &str, numeric: bool) {
@@ -256,6 +379,10 @@ fn cell_ui(ui: &mut egui::Ui, text: &str, numeric: bool) {
 
 impl eframe::App for TesseraGui {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        if self.poll_sql() {
+            // Keep repainting so the result shows up (and the timer ticks).
+            ctx.request_repaint_after(Duration::from_millis(100));
+        }
         // Accept a file dropped anywhere on the window.
         let dropped = ctx.input(|i| {
             i.raw
@@ -287,22 +414,32 @@ impl eframe::App for TesseraGui {
 
                 // CSV parse settings. Changing either re-opens the current file
                 // (and resets the SQL session) so both views agree.
+                let lazy = self.lazy.is_some();
                 let before = (self.delimiter, self.has_header);
-                egui::ComboBox::from_id_salt("delimiter")
-                    .selected_text(self.delimiter.label())
-                    .show_ui(ui, |ui| {
-                        for d in Delimiter::ALL {
-                            ui.selectable_value(&mut self.delimiter, d, d.label());
-                        }
-                    });
-                ui.checkbox(&mut self.has_header, "Header")
-                    .on_hover_text("first row is column names");
+                ui.add_enabled_ui(!lazy, |ui| {
+                    egui::ComboBox::from_id_salt("delimiter")
+                        .selected_text(self.delimiter.label())
+                        .show_ui(ui, |ui| {
+                            for d in Delimiter::ALL {
+                                ui.selectable_value(&mut self.delimiter, d, d.label());
+                            }
+                        });
+                    ui.checkbox(&mut self.has_header, "Header")
+                        .on_hover_text("first row is column names");
+                });
                 if (self.delimiter, self.has_header) != before {
                     self.reopen();
                 }
 
                 ui.separator();
-                ui.selectable_value(&mut self.sql_mode, false, "Search");
+                // Large files have no in-memory copy to search, so SQL only.
+                if lazy {
+                    self.sql_mode = true;
+                }
+                ui.add_enabled_ui(!lazy, |ui| {
+                    ui.selectable_value(&mut self.sql_mode, false, "Search")
+                        .on_disabled_hover_text("large file: search with SQL (WHERE …)");
+                });
                 ui.selectable_value(&mut self.sql_mode, true, "SQL");
                 if self.sql_mode {
                     let resp = ui.add(
@@ -314,6 +451,10 @@ impl eframe::App for TesseraGui {
                         || (resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)));
                     if run {
                         self.run_sql();
+                    }
+                    if let Some(t) = self.sql_started {
+                        ui.spinner();
+                        ui.weak(format!("running… {:.1}s", t.elapsed().as_secs_f32()));
                     }
                 } else {
                     ui.add(
@@ -347,6 +488,13 @@ impl eframe::App for TesseraGui {
                         table.kind.label(),
                         table.num_cols(),
                     ));
+                } else if let Some(l) = &self.lazy {
+                    let name = l.path.file_name().and_then(|s| s.to_str()).unwrap_or("?");
+                    ui.weak(format!(
+                        "{name}  ·  [Parquet]  ·  {} cols  ·  {} rows  ·  large file: not loaded, browse with SQL",
+                        l.cols,
+                        group_digits(l.rows),
+                    ));
                 } else {
                     ui.weak("Drag a CSV or Parquet file onto the window, or type a path above.");
                 }
@@ -355,10 +503,14 @@ impl eframe::App for TesseraGui {
                 }
                 if self.sql_mode {
                     if let Some(res) = &self.sql_result {
+                        let took = self
+                            .sql_elapsed
+                            .map(|d| format!(" in {:.2}s", d.as_secs_f32()))
+                            .unwrap_or_default();
                         ui.weak(if res.truncated {
-                            format!("  ·  SQL: showing first {} rows", SQL_ROW_CAP)
+                            format!("  ·  SQL: showing first {} rows{took}", group_digits(SQL_ROW_CAP))
                         } else {
-                            format!("  ·  SQL: {} rows", res.rows.len())
+                            format!("  ·  SQL: {} rows{took}", group_digits(res.rows.len()))
                         });
                     }
                     if let Some(err) = &self.sql_error {
@@ -387,6 +539,12 @@ impl eframe::App for TesseraGui {
                     }
                     Some(_) => {
                         ui.weak("(query returned no columns)");
+                    }
+                    None if self.sql_pending.is_some() => {
+                        ui.horizontal(|ui| {
+                            ui.spinner();
+                            ui.weak("running query…");
+                        });
                     }
                     None if self.sql_error.is_none() => {
                         ui.weak(format!(
@@ -518,6 +676,98 @@ mod tests {
         }
         f.flush().unwrap();
         p
+    }
+
+    fn sample_parquet(rows: i64) -> PathBuf {
+        use arrow::array::{Int64Array, StringArray};
+        use arrow::datatypes::{DataType, Field, Schema};
+        use arrow::record_batch::RecordBatch;
+        use parquet::arrow::ArrowWriter;
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static SEQ: AtomicU32 = AtomicU32::new(0);
+
+        let mut p = std::env::temp_dir();
+        p.push(format!(
+            "tessera_gui_{}_{}.parquet",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("name", DataType::Utf8, false),
+        ]));
+        let ids: Vec<i64> = (0..rows).collect();
+        let names: Vec<String> = ids.iter().map(|i| format!("name{i}")).collect();
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int64Array::from(ids)),
+                Arc::new(StringArray::from(names)),
+            ],
+        )
+        .unwrap();
+        let file = std::fs::File::create(&p).unwrap();
+        let mut w = ArrowWriter::try_new(file, schema, None).unwrap();
+        w.write(&batch).unwrap();
+        w.close().unwrap();
+        p
+    }
+
+    /// Block until the background query finishes (tests only).
+    fn wait_sql(app: &mut TesseraGui) {
+        for _ in 0..500 {
+            if !app.poll_sql() {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        panic!("query did not finish");
+    }
+
+    #[test]
+    fn large_parquet_opens_in_sql_mode_without_loading() {
+        let path = sample_parquet(50);
+        let mut app = TesseraGui::new(None);
+        app.lazy_threshold = 10; // treat 50 rows as "large"
+        app.open(&path);
+
+        // Nothing was materialised; only the footer's shape is known.
+        assert!(app.table.is_none());
+        let lazy = app.lazy.as_ref().expect("lazy mode");
+        assert_eq!((lazy.rows, lazy.cols), (50, 2));
+        assert!(app.sql_mode);
+
+        // The preview query runs in the background and shows the rows.
+        wait_sql(&mut app);
+        assert_eq!(app.sql_result.as_ref().unwrap().rows.len(), 50);
+
+        // Searching is done with SQL over the whole file.
+        app.sql_input = "SELECT id FROM data WHERE name LIKE 'name4%' ORDER BY id".into();
+        app.run_sql();
+        wait_sql(&mut app);
+        let res = app.sql_result.as_ref().unwrap();
+        assert_eq!(res.rows.len(), 11); // name4, name40..name49
+        assert_eq!(res.rows[0], vec!["4".to_string()]);
+        assert!(app.sql_error.is_none());
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn small_parquet_still_loads_normally() {
+        let path = sample_parquet(5);
+        let app = TesseraGui::new(Some(path.clone()));
+        assert!(app.lazy.is_none());
+        assert_eq!(app.table.as_ref().unwrap().num_rows(), 5);
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn groups_digits() {
+        assert_eq!(group_digits(0), "0");
+        assert_eq!(group_digits(999), "999");
+        assert_eq!(group_digits(1000), "1,000");
+        assert_eq!(group_digits(10_000_000), "10,000,000");
     }
 
     #[test]
